@@ -61,7 +61,7 @@ Tacet is built with a decoupled client-daemon architecture:
 Prerequisites: Rust 1.80+ (Cargo).
 
 ```bash
-# Option 1: Build release binaries and install to ~/bin/
+# Option 1: Build release binaries via the helper script (does not install)
 ./scripts/build.sh
 
 # Option 2: Build with cargo directly
