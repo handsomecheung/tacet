@@ -86,12 +86,28 @@ pub enum Commands {
     /// Render {{ tacet://... }} placeholders (supports stdin/stdout)
     Inject {
         /// Template input file (reads from stdin if omitted)
-        #[arg(short = 'i', long = "in")]
+        #[arg(short = 'i', long = "in", conflicts_with_all = ["in_dir", "out_dir"])]
         input: Option<PathBuf>,
 
         /// Destination output file (writes to stdout if omitted)
-        #[arg(short = 'o', long = "out")]
+        #[arg(short = 'o', long = "out", conflicts_with_all = ["in_dir", "out_dir"])]
         output: Option<PathBuf>,
+
+        /// Recursively render all files under this directory (requires --out-dir)
+        #[arg(long = "in-dir", requires = "out_dir")]
+        in_dir: Option<PathBuf>,
+
+        /// Destination directory mirroring the input structure (requires --in-dir)
+        #[arg(long = "out-dir", requires = "in_dir")]
+        out_dir: Option<PathBuf>,
+
+        /// Overwrite existing output files in --out-dir
+        #[arg(long, requires = "out_dir")]
+        force: bool,
+
+        /// Also copy files without placeholders (and binary files) unchanged
+        #[arg(long = "copy-all", requires = "out_dir")]
+        copy_all: bool,
     },
 
     /// Inject resolved env vars into subprocess & mask output

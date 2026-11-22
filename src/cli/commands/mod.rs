@@ -9,7 +9,7 @@ pub mod status;
 pub mod sync;
 pub mod unlock;
 
-pub use inject::execute_inject;
+pub use inject::{execute_inject, execute_inject_dir};
 pub use list::execute_list;
 pub use lock::execute_lock;
 pub use login::execute_login;

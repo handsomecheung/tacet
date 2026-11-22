@@ -155,7 +155,19 @@ tacet inject -i config.template.json -o config.json
 
 # Stdin / Stdout pipeline
 cat template.env | tacet inject > .env
+
+# Recursively render a directory into another directory
+tacet inject --in-dir ./templates --out-dir ./rendered
 ```
+
+Directory mode (`--in-dir` / `--out-dir`, which cannot be combined with `-i`/`-o`):
+
+- Mirrors the input structure; only files containing placeholders are written. Add `--copy-all` to also copy all other files (including binary ones) unchanged.
+- Symlinks are skipped, and non-UTF-8 files are skipped unless `--copy-all` is given.
+- `--out-dir` must not be inside `--in-dir`.
+- If any output file already exists the command fails before writing anything; pass `--force` to overwrite.
+- All URIs are resolved in one batch first; any failure aborts without writing files.
+- Output files are created with mode `0600` and new directories with `0700`.
 
 ### 6. Run Commands with Secret Injection
 Pass secrets directly into environment variables with real-time output redaction:

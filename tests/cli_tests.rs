@@ -1,6 +1,6 @@
 use std::fs;
 use std::time::Duration;
-use tacet::cli::commands::{execute_inject, execute_list, execute_run};
+use tacet::cli::commands::{execute_inject, execute_inject_dir, execute_list, execute_run};
 use tacet::cli::masker::StreamMasker;
 use tacet::crypto::symmetric_key::SymmetricKey;
 use tacet::daemon::{bind_unix_socket, run_server, DaemonClient, DaemonState};
@@ -131,6 +131,75 @@ API_KEY={{ tacet://personal/AppConfig/notes?json=api.key }}
         !bad_output_file.exists(),
         "Must NOT write output file on failure"
     );
+
+    // 3. Directory mode
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let src = tmp.path().join("src_dir");
+        fs::create_dir_all(src.join("a/b")).unwrap();
+        fs::write(
+            src.join("a/b/app.env"),
+            "P={{ tacet://personal/AppConfig/password }}",
+        )
+        .unwrap();
+        fs::write(src.join("plain.txt"), "no secrets").unwrap();
+        fs::write(src.join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
+        symlink(src.join("plain.txt"), src.join("link.txt")).unwrap();
+
+        let dst = tmp.path().join("dst_dir");
+        execute_inject_dir(&client, src.clone(), dst.clone(), false, false)
+            .await
+            .expect("dir inject failed");
+        assert_eq!(
+            fs::read_to_string(dst.join("a/b/app.env")).unwrap(),
+            "P=database_password_999"
+        );
+        assert!(!dst.join("plain.txt").exists());
+        assert!(!dst.join("bin.dat").exists());
+        let mode = fs::metadata(dst.join("a/b/app.env"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // Existing output without --force fails and writes nothing new
+        let err = execute_inject_dir(&client, src.clone(), dst.clone(), false, true).await;
+        assert!(err.is_err());
+        assert!(!dst.join("plain.txt").exists());
+
+        // --force with --copy-all overwrites and copies everything but symlinks
+        execute_inject_dir(&client, src.clone(), dst.clone(), true, true)
+            .await
+            .expect("forced dir inject failed");
+        assert_eq!(
+            fs::read_to_string(dst.join("plain.txt")).unwrap(),
+            "no secrets"
+        );
+        assert_eq!(
+            fs::read(dst.join("bin.dat")).unwrap(),
+            vec![0xff, 0xfe, 0x00]
+        );
+        assert!(!dst.join("link.txt").exists());
+
+        // Output inside input is rejected
+        assert!(
+            execute_inject_dir(&client, src.clone(), src.join("out"), false, false)
+                .await
+                .is_err()
+        );
+
+        // Resolution failure writes nothing
+        let bad_src = tmp.path().join("bad_src");
+        fs::create_dir_all(&bad_src).unwrap();
+        fs::write(bad_src.join("x"), "{{ tacet://personal/Nope/password }}").unwrap();
+        let bad_dst = tmp.path().join("bad_dst");
+        assert!(
+            execute_inject_dir(&client, bad_src, bad_dst.clone(), false, false)
+                .await
+                .is_err()
+        );
+        assert!(!bad_dst.exists());
+    }
 
     let _ = shutdown_tx.send(());
     let _ = server_handle.await;

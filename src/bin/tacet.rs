@@ -1,7 +1,7 @@
 use clap::Parser;
 use tacet::cli::commands::{
-    execute_inject, execute_list, execute_lock, execute_login, execute_logout, execute_read,
-    execute_run, execute_status, execute_sync, execute_unlock,
+    execute_inject, execute_inject_dir, execute_list, execute_lock, execute_login, execute_logout,
+    execute_read, execute_run, execute_status, execute_sync, execute_unlock,
 };
 use tacet::cli::{ensure_daemon_running, Cli, Commands};
 use tacet::daemon::default_socket_path;
@@ -51,7 +51,17 @@ async fn main() {
             json,
         } => execute_list(&client, scope, search, json).await,
         Commands::Read { uri } => execute_read(&client, uri).await,
-        Commands::Inject { input, output } => execute_inject(&client, input, output).await,
+        Commands::Inject {
+            input,
+            output,
+            in_dir,
+            out_dir,
+            force,
+            copy_all,
+        } => match (in_dir, out_dir) {
+            (Some(i), Some(o)) => execute_inject_dir(&client, i, o, force, copy_all).await,
+            _ => execute_inject(&client, input, output).await,
+        },
         Commands::Run {
             env_file,
             no_mask,

@@ -194,7 +194,7 @@ Attachment reads obtain a fresh URL from upstream `GET /ciphers/{cipher_id}/atta
    - The CLI tests connectivity to the UDS socket before executing commands.
    - If unreachable, it forks/spawns `tacetd` detached and polls `/v1/status` until ready (timeout: 5 seconds).
 2. **Fail-Fast Policy:**
-   - In `tacet run` and `tacet inject`, if any URI fails to resolve (e.g. locked vault, missing item, ambiguous match), the command aborts immediately with a non-zero exit code before child process execution.
+   - In `tacet run` and `tacet inject`, if any URI fails to resolve (e.g. locked vault, missing item, ambiguous match), the command aborts immediately with a non-zero exit code before child process execution. In `tacet inject --in-dir/--out-dir`, all URIs across the directory are resolved in one batch and nothing is written if any fails; existing outputs require `--force`, and outputs are created with mode `0600`.
 3. **Real-Time Stream Masking (`tacet run`):**
    - Secrets of length $\ge 4$ characters are registered into a thread-safe stream filter.
    - `stdout` and `stderr` streams of the child process are monitored line-by-line / chunk-by-chunk and matching secret tokens are redacted to `[TACET_MASKED]`.
