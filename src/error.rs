@@ -56,6 +56,11 @@ pub enum CryptoError {
 
 #[derive(Error, Debug)]
 pub enum UpstreamError {
+    #[error("Attachment exceeds the 64 MiB encrypted download limit")]
+    AttachmentTooLarge,
+
+    #[error("Invalid attachment download URL")]
+    InvalidAttachmentUrl,
     #[error("HTTP request failed: {0}")]
     RequestFailed(#[from] reqwest::Error),
 
@@ -110,6 +115,17 @@ pub enum UriError {
 
 #[derive(Error, Debug)]
 pub enum ResolverError {
+    #[error("Attachment '{file}' not found in item '{item}'")]
+    AttachmentNotFound { file: String, item: String },
+
+    #[error("Ambiguous attachment '{file}': matching IDs [{matches}]")]
+    AmbiguousAttachment { file: String, matches: String },
+
+    #[error("Attachments require 'tacet read'; inject and run support text fields only")]
+    AttachmentRequiresRead,
+
+    #[error("Attachment references do not support json or explicit trim modifiers")]
+    InvalidAttachmentModifier,
     #[error("Item '{item}' not found in scope '{scope}'")]
     ItemNotFound { item: String, scope: String },
 

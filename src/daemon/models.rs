@@ -100,6 +100,21 @@ pub struct ResolveRequest {
     pub uris: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadRequest {
+    pub uri: String,
+}
+
+pub struct ReadResponse {
+    pub bytes: Vec<u8>,
+    pub is_attachment: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachmentsResponse {
+    pub attachments: Vec<crate::resolver::AttachmentSummary>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveResponse {
     pub secrets: HashMap<String, String>,

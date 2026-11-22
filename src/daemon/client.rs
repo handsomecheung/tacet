@@ -1,7 +1,7 @@
 use crate::daemon::models::{
-    ErrorResponse, ListResponse, LockResponse, LoginRequest, LoginResponse, LogoutResponse,
-    ResolveRequest, ResolveResponse, StatusResponse, SyncStatusResponse, UnlockRequest,
-    UnlockResponse,
+    AttachmentsResponse, ErrorResponse, ListResponse, LockResponse, LoginRequest, LoginResponse,
+    LogoutResponse, ReadRequest, ReadResponse, ResolveRequest, ResolveResponse, StatusResponse,
+    SyncStatusResponse, UnlockRequest, UnlockResponse,
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -56,6 +56,16 @@ impl DaemonClient {
         path: &str,
         body: Option<&Req>,
     ) -> Result<Resp, DaemonClientError> {
+        let (_, bytes) = self.send_raw(method, path, body).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    async fn send_raw<Req: serde::Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Req>,
+    ) -> Result<(hyper::HeaderMap, Vec<u8>), DaemonClientError> {
         let stream = UnixStream::connect(&self.socket_path).await?;
         let io = TokioIo::new(stream);
         let (mut sender, conn) = http1::handshake(io).await?;
@@ -81,11 +91,11 @@ impl DaemonClient {
 
         let resp = sender.send_request(req).await?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let resp_bytes = resp.into_body().collect().await?.to_bytes();
 
         if status.is_success() {
-            let data: Resp = serde_json::from_slice(&resp_bytes)?;
-            Ok(data)
+            Ok((headers, resp_bytes.to_vec()))
         } else {
             let message = if let Ok(err_resp) = serde_json::from_slice::<ErrorResponse>(&resp_bytes)
             {
@@ -133,6 +143,36 @@ impl DaemonClient {
         let req = ResolveRequest { uris };
         self.send_json(Method::POST, "/v1/resolve", Some(&req))
             .await
+    }
+
+    /// Reads a field or attachment as bytes, retaining the kind for CLI newline handling.
+    pub async fn read(&self, uri: &str) -> Result<ReadResponse, DaemonClientError> {
+        let (headers, bytes) = self
+            .send_raw(
+                Method::POST,
+                "/v1/read",
+                Some(&ReadRequest { uri: uri.into() }),
+            )
+            .await?;
+        Ok(ReadResponse {
+            bytes,
+            is_attachment: headers
+                .get("x-tacet-value-kind")
+                .is_some_and(|value| value == "attachment"),
+        })
+    }
+
+    pub async fn attachments(
+        &self,
+        item_id: &str,
+    ) -> Result<AttachmentsResponse, DaemonClientError> {
+        let id = percent_encoding::utf8_percent_encode(item_id, percent_encoding::NON_ALPHANUMERIC);
+        self.send_json::<(), AttachmentsResponse>(
+            Method::GET,
+            &format!("/v1/items/{id}/attachments"),
+            None,
+        )
+        .await
     }
 
     pub async fn list(

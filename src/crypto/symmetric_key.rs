@@ -1,6 +1,6 @@
 use crate::crypto::cipher_string::CipherString;
 use crate::error::CryptoError;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A 64-byte symmetric key consisting of:
 /// - EncKey: 32 bytes (for AES-256-CBC)
@@ -45,12 +45,12 @@ impl SymmetricKey {
         stretched_master_key: &[u8; 64],
     ) -> Result<Self, CryptoError> {
         let cs = CipherString::parse(protected_key_str)?;
-        let mut enc_key = [0u8; 32];
-        let mut mac_key = [0u8; 32];
+        let mut enc_key = Zeroizing::new([0u8; 32]);
+        let mut mac_key = Zeroizing::new([0u8; 32]);
         enc_key.copy_from_slice(&stretched_master_key[..32]);
         mac_key.copy_from_slice(&stretched_master_key[32..]);
 
-        let raw_bytes = cs.decrypt_type2(&enc_key, &mac_key)?;
+        let raw_bytes = Zeroizing::new(cs.decrypt_type2(&enc_key, &mac_key)?);
         Self::from_slice(&raw_bytes)
     }
 

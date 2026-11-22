@@ -4,19 +4,19 @@ use crate::crypto::kdf::{
 };
 use crate::crypto::symmetric_key::SymmetricKey;
 use crate::daemon::models::{
-    ErrorResponse, ListQuery, ListResponse, LockResponse, LoginRequest, LoginResponse,
-    LogoutResponse, ResolveRequest, ResolveResponse, StatusResponse, SyncStatusResponse,
-    UnlockRequest, UnlockResponse,
+    AttachmentsResponse, ErrorResponse, ListQuery, ListResponse, LockResponse, LoginRequest,
+    LoginResponse, LogoutResponse, ReadRequest, ResolveRequest, ResolveResponse, StatusResponse,
+    SyncStatusResponse, UnlockRequest, UnlockResponse,
 };
 use crate::daemon::state::DaemonState;
-use crate::error::ResolverError;
-use crate::resolver::VaultResolver;
+use crate::error::{ResolverError, UpstreamError};
+use crate::resolver::{ReadTarget, VaultResolver};
 use crate::storage::session::SessionMetadata;
 use crate::storage::vault_cache::EncryptedVaultCache;
 use crate::upstream::models::TwoFactorCredentials;
 use crate::upstream::UpstreamClient;
 use crate::uri::parser::TacetUri;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -33,6 +33,8 @@ pub fn create_router(state: DaemonState) -> Router {
         .route("/v1/logout", post(logout_handler))
         .route("/v1/sync", post(sync_handler))
         .route("/v1/resolve", post(resolve_handler))
+        .route("/v1/read", post(read_handler))
+        .route("/v1/items/{item_id}/attachments", get(attachments_handler))
         .route("/v1/list", get(list_handler))
         .with_state(state)
 }
@@ -614,42 +616,188 @@ async fn resolve_handler(
             )
         })?;
 
-        match resolver.resolve(&parsed_uri) {
-            Ok(value) => {
-                secrets.insert(uri_str.clone(), value);
-            }
-            Err(ResolverError::ItemNotFound { .. })
-            | Err(ResolverError::FieldNotFound { .. })
-            | Err(ResolverError::FolderNotFound { .. })
-            | Err(ResolverError::CollectionNotFound { .. })
-            | Err(ResolverError::OrganizationNotFound { .. }) => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new(format!(
-                        "Secret resolution failed for '{uri_str}': {e}",
-                        e = ResolverError::ItemNotFound {
-                            item: parsed_uri.item,
-                            scope: parsed_uri.scope.to_string(),
-                        }
-                    ))),
-                ));
-            }
-            Err(err @ ResolverError::AmbiguousMatch { .. }) => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse::new(err.to_string())),
-                ));
-            }
-            Err(other) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(other.to_string())),
-                ));
-            }
-        }
+        let value = resolver.resolve(&parsed_uri).map_err(resolver_response)?;
+        secrets.insert(uri_str.clone(), value);
     }
 
     Ok(Json(ResolveResponse { secrets }))
+}
+
+type ApiError = (StatusCode, Json<ErrorResponse>);
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+    (status, Json(ErrorResponse::new(message)))
+}
+
+fn resolver_response(error: ResolverError) -> ApiError {
+    let status = match &error {
+        ResolverError::ItemNotFound { .. }
+        | ResolverError::FieldNotFound { .. }
+        | ResolverError::AttachmentNotFound { .. }
+        | ResolverError::FolderNotFound { .. }
+        | ResolverError::OrganizationNotFound { .. }
+        | ResolverError::CollectionNotFound { .. } => StatusCode::NOT_FOUND,
+        ResolverError::AmbiguousMatch { .. } | ResolverError::AmbiguousAttachment { .. } => {
+            StatusCode::CONFLICT
+        }
+        ResolverError::AttachmentRequiresRead
+        | ResolverError::InvalidAttachmentModifier
+        | ResolverError::JsonPathError(_) => StatusCode::BAD_REQUEST,
+        ResolverError::Crypto(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    api_error(status, error.to_string())
+}
+
+fn read_response(bytes: Vec<u8>, attachment: bool, encoded: bool) -> axum::response::Response {
+    let content_type = if attachment && !encoded {
+        "application/octet-stream"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    (
+        [
+            ("content-type", content_type),
+            ("cache-control", "no-store"),
+            (
+                "x-tacet-value-kind",
+                if attachment { "attachment" } else { "field" },
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn read_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<ReadRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    state.touch_activity();
+    let uri =
+        TacetUri::parse(&req.uri).map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let selected = {
+        let key_guard = state.symmetric_key.read().await;
+        let key = key_guard.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "Vault is locked. Run 'tacet unlock' first.",
+            )
+        })?;
+        let vault_guard = state.vault.read().await;
+        let vault = vault_guard.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "Vault cache is empty. Please run sync.",
+            )
+        })?;
+        let rsa_guard = state.rsa_private_key.read().await;
+        let resolver = VaultResolver::new(vault, key, rsa_guard.as_ref());
+        match resolver.select_read(&uri).map_err(resolver_response)? {
+            ReadTarget::Text(value) => return Ok(read_response(value.into_bytes(), false, false)),
+            ReadTarget::Attachment(selected) => selected,
+        }
+    };
+    // Release key guards before network IO so locking remains immediate during downloads.
+    let (client, token) = attachment_session(&state).await?;
+    let encrypted = client
+        .download_attachment(
+            &token,
+            &selected.cipher_id,
+            &selected.attachment.id,
+            selected.attachment.url.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                UpstreamError::AttachmentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                UpstreamError::HttpStatusError { status: 404, .. } => StatusCode::NOT_FOUND,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            api_error(status, e.to_string())
+        })?;
+    let key_guard = state.symmetric_key.read().await;
+    let key = key_guard.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "Vault was locked during attachment download",
+        )
+    })?;
+    let vault_guard = state.vault.read().await;
+    let vault = vault_guard
+        .as_ref()
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Vault is unavailable"))?;
+    let rsa_guard = state.rsa_private_key.read().await;
+    let resolver = VaultResolver::new(vault, key, rsa_guard.as_ref());
+    let bytes = resolver
+        .decrypt_attachment(&selected, &encrypted, &uri)
+        .map_err(resolver_response)?;
+    state.touch_activity();
+    Ok(read_response(bytes, true, uri.modifiers.encoding.is_some()))
+}
+
+async fn attachment_session(state: &DaemonState) -> Result<(UpstreamClient, String), ApiError> {
+    let client = state
+        .upstream_client
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Not logged in"))?;
+    let mut guard = state.session.write().await;
+    let session = guard
+        .as_mut()
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Not logged in"))?;
+    if session
+        .expires_at
+        .is_some_and(|expiry| expiry <= Utc::now() + Duration::seconds(60))
+    {
+        let refresh = session.refresh_token.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "Session expired. Run 'tacet login' again.",
+            )
+        })?;
+        let response = client.refresh_token(refresh).await.map_err(|_| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "Session refresh failed. Run 'tacet login' again.",
+            )
+        })?;
+        session.access_token = response.access_token;
+        if let Some(refresh) = response.refresh_token {
+            session.refresh_token = Some(refresh);
+        }
+        session.expires_at = Some(Utc::now() + Duration::seconds(response.expires_in as i64));
+        session
+            .save(&state.storage_paths)
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok((client, session.access_token.clone()))
+}
+
+async fn attachments_handler(
+    State(state): State<DaemonState>,
+    Path(item_id): Path<String>,
+) -> Result<Json<AttachmentsResponse>, ApiError> {
+    state.touch_activity();
+    if uuid::Uuid::parse_str(&item_id).is_err() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Expected an item UUID"));
+    }
+    let key_guard = state.symmetric_key.read().await;
+    let key = key_guard
+        .as_ref()
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Vault is locked"))?;
+    let vault_guard = state.vault.read().await;
+    let vault = vault_guard
+        .as_ref()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Vault cache is empty"))?;
+    let rsa_guard = state.rsa_private_key.read().await;
+    let resolver = VaultResolver::new(vault, key, rsa_guard.as_ref());
+    Ok(Json(AttachmentsResponse {
+        attachments: resolver
+            .list_attachments(&item_id)
+            .map_err(resolver_response)?,
+    }))
 }
 
 async fn list_handler(

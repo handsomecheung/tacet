@@ -52,6 +52,7 @@ Tacet is built with a decoupled client-daemon architecture:
 - **Fail-Fast Guarantees:** Aborts process execution before launching child commands if any referenced secret cannot be resolved or is locked.
 - **Real-Time Stream Masking:** Transparently monitors child process `stdout` and `stderr` in `tacet run`, masking sensitive values with `[TACET_MASKED]`.
 - **Dynamic TOTP Generation:** Live RFC 6238 6-digit TOTP code calculation from Bitwarden authenticator keys.
+- **Attachment Downloads:** Read authenticated, encrypted attachments by filename or ID and write their original bytes to stdout, with optional base64 or hex encoding.
 - **Flexible `tacet://` URIs:** Expressive URI format supporting folders, organizations, collections, custom fields, and modifiers (e.g. `base64`, `json=<path>`, `trim`).
 
 ---
@@ -115,10 +116,14 @@ tacet list --json
 
 Listed URI prefixes preserve `/` in nested folder and collection paths. Append a field target such as `/password` to read a secret.
 
+Empty items and items containing only attachments are included. If an item's name is empty or its name or item key cannot be decrypted, the list displays its UUID as the name and URI item target instead of omitting it. Organization items with unavailable organization keys are also retained; collection UUIDs stand in for unavailable collection names. Scope and search filters still apply. Listing an item does not guarantee that its contents can be decrypted.
+
 Organization items appear once per collection membership, with a scope and URI prefix for each collection. Scope and search filters apply to each entry separately. JSON output uses the same entries, so an item in multiple collections has multiple records with the same `id`. The table footer reports both the number of entries and the number of unique items, for example `Total: 2 entries (1 unique item)`.
 
-### 4. Read a Secret
-Fetch a single secret to standard output:
+`list` and item/attachment lookup use the daemon's local vault cache; they do not automatically sync with the server. Search matches item names, UUIDs, folders, and scopes, not attachment filenames. Run `tacet sync` after changing items or attachments in another client.
+
+### 4. Read a Secret or Attachment
+Fetch a single secret field or attachment to standard output:
 
 ```bash
 # Print password
@@ -126,7 +131,20 @@ tacet read "tacet://personal/GitHub/password"
 
 # Generate live TOTP token
 tacet read "tacet://personal/AWS/totp"
+
+# Download an attachment; use files/ to select an attachment explicitly
+tacet read "tacet://personal/Server/example.exe" > example.exe
+tacet read "tacet://personal/Server/files/example.exe" > example.exe
+
+# Encode the attachment's original bytes
+tacet read "tacet://personal/Server/files/example.exe?encoding=base64" > example.exe.b64
 ```
+
+Field reads append a newline unless `--no-newline` is set. Attachment reads never append a newline, including encoded reads, and preserve all original whitespace and binary bytes. Diagnostics go to stderr. Redirected files are created or truncated by the shell before Tacet runs; their permissions follow your shell's `umask`. Parent directories must already exist.
+
+Attachments require an unlocked vault and an online server. After upgrading from a version without attachment support, run `tacet sync` to refresh cached attachment metadata. Downloads are verified before any contents are returned. The initial implementation buffers encrypted files in memory, limits each encrypted download to 64 MiB, and supports authenticated Type 2 attachment payloads, including legacy attachments without a dedicated key and modern attachments using item keys. Larger files and other payload formats return an error.
+
+If a newly added item is missing from `list`, or an attachment lookup returns 404, refresh the cache with `tacet sync`. Older cache files may contain items without their attachment metadata. If syncing fails with an upstream 401, repeat your usual `tacet login` command to obtain a valid session; unlocking alone does not renew an expired access token. Then retry syncing and reading the attachment. A successful sync does not resolve a 404 caused by an incorrect reference or an attachment that was deleted upstream.
 
 ### 5. Template Injection
 Replace `{{ tacet://... }}` placeholders in configuration templates without writing secrets to disk:
@@ -168,7 +186,7 @@ tacet unlock
 Tacet uses a standardized URI format to reference secrets:
 
 ```text
-tacet://<scope>/<item>/<field>[?<modifiers>]
+tacet://<scope>/<item>/<target>[?<modifiers>]
 ```
 
 ### 1. `<scope>` Rules
@@ -185,11 +203,11 @@ tacet://<scope>/<item>/<field>[?<modifiers>]
 - Case-insensitive search by item `name` (e.g., `GitHub`, `Postgres DB`).
 - Supports exact 36-character item `UUID` (e.g., `d3b07384-d113-46fb-9c88-e9f02c61e808`).
 - Nested collection and folder paths use `/` directly, e.g. `tacet://org/Default/Network/Koishi/Infra/wireproxy/password`. Existing `%2F`-encoded paths remain supported.
-- Paths are parsed from the end: `<item>/<field>` or `<item>/fields/<custom_field>`. The preceding path is the collection or folder. The `fields` segment immediately before the final segment introduces an explicit custom field.
+- Paths are parsed from the end: `<item>/<target>`, `<item>/fields/<custom_field>`, or `<item>/files/<filename-or-id>`. The preceding path is the collection or folder. The literal `fields` and `files` segments immediately before the final segment introduce an explicit custom field or attachment, respectively.
 - Spaces can be preserved inside quotes; slashes inside organization, item, and field names must be encoded as `%2F`.
 - If multiple items match the query, Tacet returns a disambiguation error listing matching UUIDs and folders.
 
-### 3. `<field>` Mapping
+### 3. `<target>` Mapping
 
 | Bitwarden Field | URI Target | Description |
 |---|---|---|
@@ -200,6 +218,11 @@ tacet://<scope>/<item>/<field>[?<modifiers>]
 | `login.uris[0].uri` | `uri` / `uri.0` | Primary URL (`uri.<n>` for index `n`) |
 | `notes` | `notes` | Secure note content |
 | `fields[name == X]` | `fields/<X>` or `<X>` | Custom field matching name `X` (falls back if built-in not matched) |
+| `attachments` | `files/<filename-or-id>` or `<filename-or-id>` | Attachment content; filenames are matched exactly and case-sensitively |
+
+Unqualified targets match a built-in field first, then a custom field, then an attachment. An empty matching field is returned as empty; a decryption error stops resolution rather than selecting an attachment. Explicit `fields/` targets never select attachments, and explicit `files/` targets never select fields. Attachment IDs take priority over filenames; duplicate filenames return an error listing matching attachment IDs. Encode `/`, `?`, `#`, and `%` within filenames as `%2F`, `%3F`, `%23`, and `%25`.
+
+`files` is now a reserved penultimate path segment, like `fields`. For example, `personal/Server/files/config.yml` selects an attachment on `Server`; it no longer addresses the field `config.yml` on an item named `files` inside folder `Server`. Use that item's UUID and an explicit `fields/` target to address such a field.
 
 ### 4. `[?<modifiers>]` (Optional Query Parameters)
 
@@ -207,6 +230,8 @@ tacet://<scope>/<item>/<field>[?<modifiers>]
 - `encoding=hex`: Encode value as lowercase hexadecimal string.
 - `json=<dot.path>`: Parse JSON payload and extract field (e.g., `?json=credentials.client_secret`).
 - `trim=true|false`: Strip leading/trailing whitespace and newlines (default: `true`).
+
+For attachments, `encoding=base64` and `encoding=hex` operate on the original bytes. The default trimming behavior does not apply. Explicit `trim` and `json` modifiers are rejected. Attachment references are supported by `tacet read`; `inject` and `run` continue to accept text fields only.
 
 ---
 
@@ -235,7 +260,7 @@ tacet sync
 # List vault items (table or json)
 tacet list [scope] [-q <query>] [--json]
 
-# Output secret value
+# Output a secret field or attachment bytes
 tacet read <uri> [--no-newline]
 
 # Inject into file templates

@@ -6,18 +6,13 @@ pub async fn execute_read(
     uri: String,
     no_newline: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client.resolve(vec![uri.clone()]).await?;
-    let secret = resp
-        .secrets
-        .get(&uri)
-        .ok_or_else(|| format!("Secret '{uri}' was not returned by daemon"))?;
-
-    if no_newline {
-        print!("{secret}");
-        io::stdout().flush()?;
-    } else {
-        println!("{secret}");
+    let resp = client.read(&uri).await?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&resp.bytes)?;
+    if !resp.is_attachment && !no_newline {
+        stdout.write_all(b"\n")?;
     }
+    stdout.flush()?;
 
     Ok(())
 }

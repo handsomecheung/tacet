@@ -89,6 +89,8 @@ fn test_vault_cache_lifecycle_and_permissions() {
         collections: vec![],
         ciphers: vec![
             CipherResponse {
+                key: None,
+                attachments: None,
                 id: "c1".to_string(),
                 organization_id: None,
                 folder_id: None,
@@ -101,6 +103,8 @@ fn test_vault_cache_lifecycle_and_permissions() {
                 fields: None,
             },
             CipherResponse {
+                key: None,
+                attachments: None,
                 id: "c2".to_string(),
                 organization_id: None,
                 folder_id: None,

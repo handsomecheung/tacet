@@ -4,4 +4,4 @@ pub mod vault_resolver;
 
 pub use json_path::extract_json_path;
 pub use totp::generate_totp;
-pub use vault_resolver::{VaultItemSummary, VaultResolver};
+pub use vault_resolver::{AttachmentSummary, ReadTarget, VaultItemSummary, VaultResolver};

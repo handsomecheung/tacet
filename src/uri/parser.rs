@@ -41,6 +41,7 @@ pub enum CipherFieldTarget {
     Uri(usize),
     Notes,
     CustomField(String),
+    File(String),
     Named(String),
 }
 
@@ -51,6 +52,9 @@ impl FromStr for CipherFieldTarget {
         let trimmed = s.trim();
         if let Some(field_name) = trimmed.strip_prefix("fields/") {
             return Ok(CipherFieldTarget::CustomField(field_name.to_string()));
+        }
+        if let Some(file_name) = trimmed.strip_prefix("files/") {
+            return Ok(CipherFieldTarget::File(file_name.to_string()));
         }
 
         let lower = trimmed.to_lowercase();
@@ -84,6 +88,7 @@ pub struct Modifiers {
     pub encoding: Option<Encoding>,
     pub json: Option<String>,
     pub trim: bool,
+    pub trim_explicit: bool,
 }
 
 impl Default for Modifiers {
@@ -92,6 +97,7 @@ impl Default for Modifiers {
             encoding: None,
             json: None,
             trim: true,
+            trim_explicit: false,
         }
     }
 }
@@ -102,6 +108,8 @@ pub struct TacetUri {
     pub scope: Scope,
     pub item: String,
     pub field: CipherFieldTarget,
+    /// Original decoded target name, preserving case for attachment fallback.
+    pub target_name: String,
     pub modifiers: Modifiers,
 }
 
@@ -149,15 +157,18 @@ impl TacetUri {
                     "json" => {
                         modifiers.json = Some(v.to_string());
                     }
-                    "trim" => match v.to_lowercase().as_str() {
-                        "true" | "1" => modifiers.trim = true,
-                        "false" | "0" => modifiers.trim = false,
-                        other => {
-                            return Err(UriError::InvalidModifier(format!(
-                                "Invalid trim value: {other}"
-                            )))
+                    "trim" => {
+                        modifiers.trim_explicit = true;
+                        match v.to_lowercase().as_str() {
+                            "true" | "1" => modifiers.trim = true,
+                            "false" | "0" => modifiers.trim = false,
+                            other => {
+                                return Err(UriError::InvalidModifier(format!(
+                                    "Invalid trim value: {other}"
+                                )))
+                            }
                         }
-                    },
+                    }
                     other => {
                         return Err(UriError::InvalidModifier(format!(
                             "Unknown modifier: {other}"
@@ -167,105 +178,74 @@ impl TacetUri {
             }
         }
 
-        // Split path segments by '/' and percent-decode each segment
+        // Determine path structure before decoding names containing escaped slashes.
         let raw_segments: Vec<&str> = path_str
             .trim_start_matches('/')
             .split('/')
             .filter(|s| !s.is_empty())
             .collect();
-
-        if raw_segments.is_empty() {
-            return Err(UriError::MissingComponent("Empty URI path"));
-        }
-
         let segments: Vec<String> = raw_segments
-            .into_iter()
+            .iter()
             .map(|s| percent_decode_str(s).decode_utf8_lossy().to_string())
             .collect();
-
-        let (scope, item, field_str) = match segments[0].as_str() {
-            "org" => {
-                if segments.len() < 5 {
-                    return Err(UriError::MissingComponent(
-                        "Organization URI requires: org/<org_name>/<collection>/<item>/<field>",
-                    ));
-                }
-                let org_name = segments[1].clone();
-                let (collection, item, field_str) =
-                    if segments.len() >= 6 && segments[segments.len() - 2] == "fields" {
-                        // Pattern: org/<org_name>/<collection...>/<item>/fields/<custom_field>
-                        let field = format!("fields/{}", segments[segments.len() - 1]);
-                        let item = segments[segments.len() - 3].clone();
-                        let collection = segments[2..segments.len() - 3].join("/");
-                        (collection, item, field)
-                    } else {
-                        // Pattern: org/<org_name>/<collection...>/<item>/<field>
-                        let field = segments[segments.len() - 1].clone();
-                        let item = segments[segments.len() - 2].clone();
-                        let collection = segments[2..segments.len() - 2].join("/");
-                        (collection, item, field)
-                    };
-
-                let scope = Scope::Organization {
-                    org_name,
-                    collection,
-                };
-                (scope, item, field_str)
-            }
-            "personal" => {
-                if segments.len() < 3 {
-                    return Err(UriError::MissingComponent(
-                        "Personal URI requires at least item and field",
-                    ));
-                }
-                let (folder, item, field_str) =
-                    if segments.len() >= 4 && segments[segments.len() - 2] == "fields" {
-                        // Pattern: personal/[<folder...>/]<item>/fields/<custom_field>
-                        let field = format!("fields/{}", segments[segments.len() - 1]);
-                        let item = segments[segments.len() - 3].clone();
-                        let folder = if segments.len() > 4 {
-                            Some(segments[1..segments.len() - 3].join("/"))
-                        } else {
-                            None
-                        };
-                        (folder, item, field)
-                    } else if segments.len() == 3 {
-                        // Pattern: personal/<item>/<field>
-                        (None, segments[1].clone(), segments[2].clone())
-                    } else {
-                        // Pattern: personal/<folder...>/<item>/<field>
-                        let field = segments[segments.len() - 1].clone();
-                        let item = segments[segments.len() - 2].clone();
-                        let folder = Some(segments[1..segments.len() - 2].join("/"));
-                        (folder, item, field)
-                    };
-
-                let scope = Scope::Personal { folder };
-                (scope, item, field_str)
-            }
-            "*" => {
-                if segments.len() < 3 {
-                    return Err(UriError::MissingComponent("URI requires item and field"));
-                }
-                let scope = Scope::All;
-                let item = segments[1].clone();
-                let field_str = if segments[2] == "fields" && segments.len() >= 4 {
-                    format!("fields/{}", segments[3..].join("/"))
-                } else {
-                    segments[2..].join("/")
-                };
-                (scope, item, field_str)
-            }
+        let scope_name = segments
+            .first()
+            .ok_or(UriError::MissingComponent("Empty URI path"))?;
+        let scope_start = match scope_name.as_str() {
+            "personal" | "*" => 1,
+            "org" => 2,
             other => return Err(UriError::InvalidScope(other.to_string())),
         };
-
-        let field = field_str.parse().unwrap();
-
+        if segments.len() < scope_start + 2 {
+            return Err(UriError::MissingComponent("URI requires item and target"));
+        }
+        let marker = raw_segments[raw_segments.len() - 2];
+        let explicit = matches!(marker, "fields" | "files") && segments.len() >= scope_start + 3;
+        let item_idx = segments.len() - if explicit { 3 } else { 2 };
+        let name = segments[segments.len() - 1].clone();
+        let target_name = name.clone();
+        let field = if explicit {
+            match marker {
+                "fields" => CipherFieldTarget::CustomField(name),
+                _ => CipherFieldTarget::File(name),
+            }
+        } else if name.contains('/') {
+            CipherFieldTarget::Named(name)
+        } else {
+            name.parse().map_err(|_: std::convert::Infallible| {
+                UriError::MissingComponent("Invalid target")
+            })?
+        };
+        let scope = match scope_name.as_str() {
+            "personal" => Scope::Personal {
+                folder: (item_idx > 1).then(|| segments[1..item_idx].join("/")),
+            },
+            "org" => {
+                if item_idx <= 2 {
+                    return Err(UriError::MissingComponent(
+                        "Organization URI requires a collection",
+                    ));
+                }
+                Scope::Organization {
+                    org_name: segments[1].clone(),
+                    collection: segments[2..item_idx].join("/"),
+                }
+            }
+            _ => {
+                if item_idx != 1 {
+                    return Err(UriError::MissingComponent(
+                        "Wildcard URI requires item and target, without a folder",
+                    ));
+                }
+                Scope::All
+            }
+        };
         Ok(Self {
             raw: trimmed.to_string(),
             scope,
-            item,
+            item: segments[item_idx].clone(),
             field,
+            target_name,
             modifiers,
         })
     }

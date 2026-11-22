@@ -27,8 +27,10 @@ This document outlines the architecture, cryptographic pipelines, security invar
 
 4. **URI Design & Ergonomics Policy ("The 'One Obvious Way' Principle"):**
    - **Single Canonical Representation:** There should be one—and preferably only one—obvious way to reference any secret. Avoid introducing redundant aliases, alternative shorthands, or syntactic synonyms (e.g. no `_` shorthand for `personal`, and strictly canonical scopes `personal`, `org`, `*`).
-   - **No Built-in Field Aliases (Prevent Custom Field Collisions):** Bitwarden custom field names allow arbitrary strings. Adding alias shortcuts (like `user`, `pass`, `otp`, `note`, `url`) hijacks those names from custom fields and causes user confusion. All built-in field targets must strictly adhere to Bitwarden's canonical field names: `username`, `password`, `totp`, `totp_secret`, `notes`, `uri` (`uri.<n>`). Any other keyword maps directly to a custom field.
-   - **Deterministic Hierarchical Paths:** Allow `/` directly in folder and collection paths. Parse from the end using `<item>/<field>` or `<item>/fields/<custom_field>`; preceding segments form the folder or collection. Use `%2F` for slashes within organization, item, and field names. Existing encoded folder and collection paths remain supported. Never introduce heuristic or vault-dependent dynamic parsers; URI parsing must remain pure, static, and deterministic.
+   - **No Built-in Field Aliases (Prevent Custom Field Collisions):** Bitwarden custom field names allow arbitrary strings. Adding alias shortcuts (like `user`, `pass`, `otp`, `note`, `url`) hijacks those names from custom fields and causes user confusion. All built-in field targets must strictly adhere to Bitwarden's canonical field names: `username`, `password`, `totp`, `totp_secret`, `notes`, `uri` (`uri.<n>`). Any other unqualified target first matches a custom field, then an attachment filename or ID.
+   - **Deterministic Hierarchical Paths:** Allow `/` directly in folder and collection paths. Parse from the end using `<item>/<target>`, `<item>/fields/<custom_field>`, or `<item>/files/<filename-or-id>`; preceding segments form the folder or collection. The literal penultimate markers `fields` and `files` select custom fields and attachments explicitly. They reserve those path positions, including paths previously addressing an item named `files`. Determine the structure before percent-decoding names. Use `%2F` for slashes within organization, item, field, and attachment names. Existing encoded folder and collection paths remain supported. Never introduce heuristic or vault-dependent dynamic parsers; URI parsing must remain pure, static, and deterministic.
+   - **Attachment Resolution:** Unqualified targets match built-in fields, custom fields, then attachments. Fall back only when a field is absent, never on empty values or decryption errors. Filenames match exactly and case-sensitively; exact attachment IDs take priority. Duplicate filenames return ambiguity errors with matching IDs. Explicit `fields/` targets cannot select attachments.
+   - **Attachment Output:** `read` writes attachment bytes to stdout without UTF-8 conversion, trimming, or a trailing newline. Base64 and hex encode the original bytes; explicit `trim` and `json` modifiers are rejected. Shell redirection is controlled by the caller; do not introduce plaintext attachment caches or temporary files. `inject`, `run`, and `/v1/resolve` remain text-field-only.
 
 ---
 
@@ -53,7 +55,7 @@ koishi/tacet/
 │   │   └── password_hash.rs    # MasterPasswordHash derivation for upstream OAuth
 │   ├── upstream/               # Bitwarden / Vaultwarden API client
 │   │   ├── mod.rs
-│   │   ├── client.rs           # reqwest-based API client (prelogin, token, sync)
+│   │   ├── client.rs           # reqwest-based API client (prelogin, token, sync, attachment download)
 │   │   ├── endpoints.rs        # URL discovery for official & self-hosted servers
 │   │   └── models.rs           # Serde models for sync, tokens, and ciphers
 │   ├── storage/                # Local encrypted storage & configuration
@@ -73,7 +75,7 @@ koishi/tacet/
 │   ├── daemon/                 # HTTP-over-UDS server (axum)
 │   │   ├── mod.rs
 │   │   ├── app.rs              # axum router setup
-│   │   ├── routes.rs           # REST endpoints (/v1/status, login, unlock, lock, logout, sync, resolve, list)
+│   │   ├── routes.rs           # REST endpoints (status, login, unlock, lock, logout, sync, resolve, read, list, attachments)
 │   │   ├── server.rs           # UnixListener bind, socket permission enforcement & peer UID check
 │   │   └── state.rs            # In-memory custody state and idle auto-lock background timer
 │   └── cli/                    # CLI execution & process management
@@ -84,6 +86,7 @@ koishi/tacet/
 │       ├── run.rs              # Process spawn, env injection, and streaming output handler
 │       └── autospawn.rs        # Automatic background daemon spawning wrapper
 └── tests/                      # Integration test suites
+    ├── attachment_tests.rs
     ├── cli_tests.rs
     ├── crypto_tests.rs
     ├── daemon_tests.rs
@@ -168,10 +171,20 @@ All cryptographic operations strictly adhere to the Bitwarden Cryptographic Spec
 | `POST /v1/lock` | None | `{"locked": true}` | — | Zeroizes SymmetricKey immediately |
 | `POST /v1/logout` | None | `{"logged_out": true}` | — | Zeroizes keys and purges local storage |
 | `POST /v1/sync` | None | `{"synced": true, "item_count": u32}` | 401, 502 | Refreshes token & updates vault cache |
-| `POST /v1/resolve` | `{"uris": [string]}` | `{"secrets": {string: string}}` | 400, 401, 404, 409 | Batch secret resolution |
-| `GET /v1/list` | None (Query: `?scope=..&search=..`) | `{"items": [{"id": "..", "name": "..", "scope": "..", "folder": "..", "cipher_type": "..", "uri_prefix": ".."}], "total": usize}` | 401, 500 | Lists item summaries with decrypted names |
+| `POST /v1/resolve` | `{"uris": [string]}` | `{"secrets": {string: string}}` | 400, 401, 404, 409, 500, 502 | Batch text-field resolution; attachments require `/v1/read` |
+| `POST /v1/read` | `{"uri": string}` | Raw value bytes | 400, 401, 404, 409, 413, 500, 502 | Single field or attachment; no extra newline |
+| `GET /v1/items/{item_id}/attachments` | None | `{"attachments": [{"id": string, "name": string, "uri": string}]}` | 400, 401, 404, 409, 500, 502 | Lists cached attachment metadata by item UUID without downloading contents |
+| `GET /v1/list` | None (Query: `?scope=..&search=..`) | `{"items": [{"id": "..", "name": "..", "scope": "..", "folder": "..", "cipher_type": "..", "uri_prefix": ".."}], "total": usize}` | 400, 401, 500 | Lists cached item summaries with decrypted names or UUID fallbacks |
 
 For `GET /v1/list`, organization items produce one entry per collection membership, with the same item `id` and a collection-specific `scope` and `uri_prefix`. Scope and search filters apply to each entry independently. `total` counts returned entries, not unique items. Entries are sorted by item name, then scope, then item ID. `tacet list --json` outputs the same entries as an array; the table footer reports both entry and unique item counts.
+
+Listing must retain empty and attachment-only items. If the name is empty or the name, item key, or organization key cannot be decrypted, use the item's UUID as its displayed name and URI item target rather than skipping the item. Preserve every collection membership even when collection names cannot be decrypted, using collection UUIDs as fallback names. These fallback entries still obey scope/search filters and the unlocked-vault requirement; their presence does not imply that secret reads can succeed.
+
+Listing, attachment discovery, and URI lookup use the daemon's in-memory vault cache without automatic sync. Search filters match item names, IDs, folders, and scopes, not attachment filenames. Old cache schemas may have discarded attachment metadata; refresh with `tacet sync` after upgrading or changing vault items elsewhere. An expired session without a refresh token requires logging in again; `unlock` only restores decryption keys and cannot renew upstream authentication. A cached item/attachment lookup failure returns 404 before any download; obtaining the download URL or downloading the blob can also return an upstream 404.
+
+For `POST /v1/read`, `Content-Type` is `application/octet-stream` for raw attachments and `text/plain; charset=utf-8` for fields or encoded attachments. `X-Tacet-Value-Kind` is `field` or `attachment`, allowing the CLI to retain field newline behavior while never adding a newline to attachments. Responses include `Cache-Control: no-store`.
+
+Attachment reads obtain a fresh URL from upstream `GET /ciphers/{cipher_id}/attachment/{attachment_id}`, falling back to the sync-provided URL only if that endpoint returns 404. Blob requests never carry the vault bearer token. Type 2 binary payloads contain `type || IV || MAC || ciphertext`; verify HMAC before decrypting or returning any plaintext. Attachment names and dedicated keys use the item's effective key, including wrapped item keys; legacy attachments without dedicated keys use the user or organization key. All decrypted key material must be zeroized. The initial implementation buffers encrypted attachments with a 64 MiB limit enforced against both content length and received chunks. No plaintext files are created. Release key guards before network requests and recheck the unlocked state before decryption, so locking remains responsive during downloads.
 
 ---
 

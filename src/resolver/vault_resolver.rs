@@ -3,13 +3,31 @@ use crate::crypto::symmetric_key::SymmetricKey;
 use crate::error::ResolverError;
 use crate::resolver::json_path::extract_json_path;
 use crate::resolver::totp::generate_totp;
-use crate::upstream::models::{CipherResponse, SyncResponse};
+use crate::upstream::models::{AttachmentResponse, CipherResponse, SyncResponse};
 use crate::uri::parser::{CipherFieldTarget, Encoding, Scope, TacetUri};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use zeroize::Zeroizing;
+
+pub enum ReadTarget {
+    Text(String),
+    Attachment(ResolvedAttachment),
+}
+
+pub struct ResolvedAttachment {
+    pub cipher_id: String,
+    pub attachment: AttachmentResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachmentSummary {
+    pub id: String,
+    pub name: String,
+    pub uri: String,
+}
 
 /// A list entry; organization items have one entry per collection membership.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,7 +63,9 @@ impl<'a> VaultResolver<'a> {
                         match cs {
                             CipherString::Type4 { .. } => {
                                 if let Some(rsa_key) = user_rsa_key {
-                                    if let Ok(raw_key) = cs.decrypt_type4(rsa_key) {
+                                    if let Ok(raw_key) =
+                                        cs.decrypt_type4(rsa_key).map(Zeroizing::new)
+                                    {
                                         if let Ok(sym) = SymmetricKey::from_slice(&raw_key) {
                                             org_keys.insert(org.id.clone(), sym);
                                         }
@@ -86,17 +106,168 @@ impl<'a> VaultResolver<'a> {
 
     /// Resolves a parsed `TacetUri` to its plaintext secret string.
     pub fn resolve(&self, uri: &TacetUri) -> Result<String, ResolverError> {
-        // Step 1: Filter ciphers and assign appropriate decryption key
+        match self.select_read(uri)? {
+            ReadTarget::Text(value) => Ok(value),
+            ReadTarget::Attachment(_) => Err(ResolverError::AttachmentRequiresRead),
+        }
+    }
+
+    /// Selects a text field or attachment without downloading any file contents.
+    pub fn select_read(&self, uri: &TacetUri) -> Result<ReadTarget, ResolverError> {
         let candidates = self.filter_scope(&uri.scope)?;
+        let (cipher, base_key) = self.match_item(&candidates, &uri.item, &uri.scope)?;
+        let key = Self::cipher_key(cipher, base_key)?;
+        if let CipherFieldTarget::File(name) = &uri.field {
+            return self.select_attachment(cipher, &key, name, uri);
+        }
+        match self.extract_field(cipher, &key, &uri.field) {
+            Ok(value) => Ok(ReadTarget::Text(self.apply_modifiers(value, uri)?)),
+            Err(ResolverError::FieldNotFound { .. })
+                if !matches!(uri.field, CipherFieldTarget::CustomField(_)) =>
+            {
+                // A missing built-in can still match a custom field or attachment.
+                if !matches!(uri.field, CipherFieldTarget::Named(_)) {
+                    match self.find_custom_field(cipher, &key, &uri.target_name) {
+                        Ok(value) => {
+                            return Ok(ReadTarget::Text(self.apply_modifiers(value, uri)?))
+                        }
+                        Err(ResolverError::FieldNotFound { .. }) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                match self.select_attachment(cipher, &key, &uri.target_name, uri) {
+                    Err(ResolverError::AttachmentNotFound { .. }) => {
+                        Err(ResolverError::FieldNotFound {
+                            field: uri.target_name.clone(),
+                            item: cipher.id.clone(),
+                        })
+                    }
+                    result => result,
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
 
-        // Step 2: Match item by 36-char UUID or case-insensitive decrypted name
-        let matched = self.match_item(&candidates, &uri.item, &uri.scope)?;
+    fn cipher_key(
+        cipher: &CipherResponse,
+        base_key: &SymmetricKey,
+    ) -> Result<SymmetricKey, ResolverError> {
+        match &cipher.key {
+            Some(wrapped_key) => {
+                let bytes = Zeroizing::new(base_key.decrypt_type2(wrapped_key)?);
+                Ok(SymmetricKey::from_slice(&bytes)?)
+            }
+            None => Ok(base_key.clone()),
+        }
+    }
 
-        // Step 3: Extract field value
-        let raw_val = self.extract_field(matched.0, matched.1, &uri.field)?;
+    fn select_attachment(
+        &self,
+        cipher: &CipherResponse,
+        key: &SymmetricKey,
+        name: &str,
+        uri: &TacetUri,
+    ) -> Result<ReadTarget, ResolverError> {
+        if uri.modifiers.json.is_some() || uri.modifiers.trim_explicit {
+            return Err(ResolverError::InvalidAttachmentModifier);
+        }
+        let attachments = cipher.attachments.as_deref().unwrap_or_default();
+        let mut matches = attachments
+            .iter()
+            .filter(|a| a.id == name)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            for attachment in attachments {
+                if key.decrypt_type2_string(&attachment.file_name)? == name {
+                    matches.push(attachment);
+                }
+            }
+        }
+        match matches.as_slice() {
+            [] => Err(ResolverError::AttachmentNotFound {
+                file: name.into(),
+                item: cipher.id.clone(),
+            }),
+            [attachment] => Ok(ReadTarget::Attachment(ResolvedAttachment {
+                cipher_id: cipher.id.clone(),
+                attachment: (*attachment).clone(),
+            })),
+            _ => Err(ResolverError::AmbiguousAttachment {
+                file: name.into(),
+                matches: matches
+                    .iter()
+                    .map(|a| a.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
+    }
 
-        // Step 4: Apply modifiers (json path, trim, encoding)
-        self.apply_modifiers(raw_val, uri)
+    /// Decrypts only after download completion, using keys from the current unlocked vault.
+    pub fn decrypt_attachment(
+        &self,
+        selected: &ResolvedAttachment,
+        bytes: &[u8],
+        uri: &TacetUri,
+    ) -> Result<Vec<u8>, ResolverError> {
+        let candidates = self.filter_scope(&uri.scope)?;
+        let (cipher, base_key) = self.match_item(&candidates, &selected.cipher_id, &uri.scope)?;
+        let key = Self::cipher_key(cipher, base_key)?;
+        let attachment = cipher
+            .attachments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|a| a.id == selected.attachment.id)
+            .ok_or_else(|| ResolverError::AttachmentNotFound {
+                file: selected.attachment.id.clone(),
+                item: cipher.id.clone(),
+            })?;
+        let content_key = match &attachment.key {
+            Some(wrapped_key) => {
+                let raw = Zeroizing::new(key.decrypt_type2(wrapped_key)?);
+                SymmetricKey::from_slice(&raw)?
+            }
+            // Legacy attachments without a dedicated key use the user/organization key.
+            None => base_key.clone(),
+        };
+        let plaintext = Zeroizing::new(
+            CipherString::from_attachment_bytes(bytes)?
+                .decrypt_type2(content_key.enc_key(), content_key.mac_key())?,
+        );
+        Ok(match uri.modifiers.encoding {
+            Some(Encoding::Base64) => BASE64_STANDARD.encode(&plaintext).into_bytes(),
+            Some(Encoding::Hex) => plaintext
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+                .into_bytes(),
+            None => plaintext.to_vec(),
+        })
+    }
+
+    pub fn list_attachments(&self, item_id: &str) -> Result<Vec<AttachmentSummary>, ResolverError> {
+        let candidates = self.filter_scope(&Scope::All)?;
+        let (cipher, base_key) = self.match_item(&candidates, item_id, &Scope::All)?;
+        let key = Self::cipher_key(cipher, base_key)?;
+        cipher
+            .attachments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|attachment| {
+                let id = percent_encoding::utf8_percent_encode(
+                    &attachment.id,
+                    percent_encoding::NON_ALPHANUMERIC,
+                );
+                Ok(AttachmentSummary {
+                    id: attachment.id.clone(),
+                    name: key.decrypt_type2_string(&attachment.file_name)?,
+                    uri: format!("tacet://*/{}/files/{id}", cipher.id),
+                })
+            })
+            .collect()
     }
 
     /// Helper to resolve a raw URI string.
@@ -108,6 +279,7 @@ impl<'a> VaultResolver<'a> {
 
     /// Lists one summary per personal item or organization item collection membership.
     /// Scope and search filters apply to each summary independently.
+    /// Empty items are retained; unavailable names and keys fall back to cached UUIDs.
     pub fn list_items(
         &self,
         scope_filter: Option<&str>,
@@ -149,18 +321,16 @@ impl<'a> VaultResolver<'a> {
         for cipher in &self.vault.ciphers {
             let is_personal = cipher.organization_id.is_none();
             let key = if let Some(org_id) = &cipher.organization_id {
-                match self.org_keys.get(org_id) {
-                    Some(k) => k,
-                    None => continue,
-                }
+                self.org_keys.get(org_id)
             } else {
-                self.user_key
+                Some(self.user_key)
             };
-
-            let dec_name = match key.decrypt_type2_string(&cipher.name) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
+            // Listing requires only cached metadata; unreadable or empty names use the UUID.
+            let dec_name = key
+                .and_then(|key| Self::cipher_key(cipher, key).ok())
+                .and_then(|key| key.decrypt_type2_string(&cipher.name).ok())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| cipher.id.clone());
 
             let folder_name = cipher
                 .folder_id
@@ -193,7 +363,7 @@ impl<'a> VaultResolver<'a> {
                 let mut collection_names: Vec<&str> = cipher
                     .collection_ids
                     .iter()
-                    .filter_map(|cid| col_names.get(cid).map(String::as_str))
+                    .map(|cid| col_names.get(cid).map(String::as_str).unwrap_or(cid))
                     .collect();
                 if collection_names.is_empty() {
                     collection_names.push("default");
@@ -449,7 +619,10 @@ impl<'a> VaultResolver<'a> {
         for &(cipher, key) in candidates {
             if is_uuid && cipher.id.eq_ignore_ascii_case(item_query) {
                 matches.push((cipher, key, item_query.to_string()));
-            } else if let Ok(dec_name) = key.decrypt_type2_string(&cipher.name) {
+            } else if let Ok(dec_name) = Self::cipher_key(cipher, key).and_then(|key| {
+                key.decrypt_type2_string(&cipher.name)
+                    .map_err(ResolverError::Crypto)
+            }) {
                 if dec_name.eq_ignore_ascii_case(item_query) {
                     matches.push((cipher, key, dec_name));
                 }
@@ -492,6 +665,7 @@ impl<'a> VaultResolver<'a> {
         target: &CipherFieldTarget,
     ) -> Result<String, ResolverError> {
         match target {
+            CipherFieldTarget::File(_) => Err(ResolverError::AttachmentRequiresRead),
             CipherFieldTarget::Username => cipher
                 .login
                 .as_ref()
@@ -576,13 +750,15 @@ impl<'a> VaultResolver<'a> {
     ) -> Result<String, ResolverError> {
         if let Some(fields) = &cipher.fields {
             for f in fields {
-                if let (Some(enc_name), Some(enc_val)) = (&f.name, &f.value) {
-                    if let Ok(dec_name) = key.decrypt_type2_string(enc_name) {
-                        if dec_name.eq_ignore_ascii_case(field_name) {
-                            return key
-                                .decrypt_type2_string(enc_val)
-                                .map_err(ResolverError::Crypto);
-                        }
+                if let Some(enc_name) = &f.name {
+                    let dec_name = key.decrypt_type2_string(enc_name)?;
+                    if dec_name.eq_ignore_ascii_case(field_name) {
+                        return match &f.value {
+                            Some(value) => key
+                                .decrypt_type2_string(value)
+                                .map_err(ResolverError::Crypto),
+                            None => Ok(String::new()),
+                        };
                     }
                 }
             }

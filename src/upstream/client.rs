@@ -1,11 +1,13 @@
 use crate::error::UpstreamError;
 use crate::upstream::models::{
-    PreloginRequest, PreloginResponse, SyncResponse, TokenResponse, TwoFactorCredentials,
-    TwoFactorErrorResponse,
+    AttachmentDownloadResponse, PreloginRequest, PreloginResponse, SyncResponse, TokenResponse,
+    TwoFactorCredentials, TwoFactorErrorResponse,
 };
 use crate::upstream::urls::BitwardenEndpoints;
 use reqwest::{Client, StatusCode};
 use std::collections::HashMap;
+
+pub const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct UpstreamClient {
@@ -51,6 +53,83 @@ impl UpstreamClient {
 
     pub fn endpoints(&self) -> &BitwardenEndpoints {
         &self.endpoints
+    }
+
+    /// Obtains a fresh download URL; older servers can expose it only in sync metadata.
+    pub async fn download_attachment(
+        &self,
+        access_token: &str,
+        cipher_id: &str,
+        attachment_id: &str,
+        fallback_url: Option<&str>,
+    ) -> Result<Vec<u8>, UpstreamError> {
+        let mut url = self.endpoints.api_url.clone();
+        url.path_segments_mut()
+            .map_err(|_| UpstreamError::InvalidAttachmentUrl)?
+            .pop_if_empty()
+            .extend(["ciphers", cipher_id, "attachment", attachment_id]);
+        let resp = self
+            .client
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| UpstreamError::RequestFailed(e.without_url()))?;
+        let status = resp.status();
+        let download_url = if status == StatusCode::NOT_FOUND && fallback_url.is_some() {
+            fallback_url
+                .map(str::to_owned)
+                .ok_or(UpstreamError::InvalidAttachmentUrl)?
+        } else if status.is_success() {
+            resp.json::<AttachmentDownloadResponse>()
+                .await
+                .map_err(|e| UpstreamError::RequestFailed(e.without_url()))?
+                .url
+        } else {
+            return Err(UpstreamError::HttpStatusError {
+                status: status.as_u16(),
+                message: "Could not obtain attachment download URL".into(),
+            });
+        };
+        let download_url = self.endpoints.api_url.join(&download_url)?;
+        if !matches!(download_url.scheme(), "https" | "http")
+            || (self.endpoints.api_url.scheme() == "https" && download_url.scheme() != "https")
+            || !download_url.username().is_empty()
+            || download_url.password().is_some()
+        {
+            return Err(UpstreamError::InvalidAttachmentUrl);
+        }
+        // Blob URLs can point to another host. Never attach the vault's bearer token.
+        let mut resp = self
+            .client
+            .get(download_url)
+            .send()
+            .await
+            .map_err(|e| UpstreamError::RequestFailed(e.without_url()))?;
+        if !resp.status().is_success() {
+            return Err(UpstreamError::HttpStatusError {
+                status: resp.status().as_u16(),
+                message: "Attachment download failed".into(),
+            });
+        }
+        if resp
+            .content_length()
+            .is_some_and(|len| len > MAX_ATTACHMENT_BYTES as u64)
+        {
+            return Err(UpstreamError::AttachmentTooLarge);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| UpstreamError::RequestFailed(e.without_url()))?
+        {
+            if chunk.len() > MAX_ATTACHMENT_BYTES - bytes.len() {
+                return Err(UpstreamError::AttachmentTooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     /// Calls `POST {identity}/accounts/prelogin` to fetch KDF configuration for an email.

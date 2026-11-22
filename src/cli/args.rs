@@ -77,7 +77,7 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Print single resolved secret to stdout
+    /// Print a secret field or write attachment bytes to stdout
     Read {
         /// Target secret URI (e.g. tacet://personal/github/password)
         uri: String,

@@ -50,6 +50,23 @@ pub enum CipherString {
 }
 
 impl CipherString {
+    /// Parses the authenticated binary attachment format: type || IV || MAC || ciphertext.
+    pub fn from_attachment_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if bytes.first() != Some(&2)
+            || bytes.len() < 65
+            || !bytes[49..].chunks_exact(16).remainder().is_empty()
+        {
+            return Err(CryptoError::InvalidCipherString(
+                "Expected a Type 2 authenticated attachment (type, IV, MAC, ciphertext)".into(),
+            ));
+        }
+        Ok(Self::Type2 {
+            iv: bytes[1..17].to_vec(),
+            mac: bytes[17..49].to_vec(),
+            ct: bytes[49..].to_vec(),
+        })
+    }
+
     /// Parses a Bitwarden CipherString, e.g. "2.<iv>|<ct>|<mac>" or "4.<ct>"
     pub fn parse(s: &str) -> Result<Self, CryptoError> {
         let trimmed = s.trim();
@@ -120,7 +137,7 @@ impl CipherString {
 
                 // 2. AES-256-CBC Decryption
                 let cipher = Aes256CbcDec::new(enc_key.into(), iv.as_slice().into());
-                let mut buf = ct.clone();
+                let mut buf = zeroize::Zeroizing::new(ct.clone());
                 let decrypted = cipher.decrypt_padded_mut::<Pkcs7>(&mut buf).map_err(|e| {
                     CryptoError::DecryptionFailed(format!("AES CBC decrypt error: {e:?}"))
                 })?;
@@ -135,7 +152,7 @@ impl CipherString {
                     )));
                 }
                 let cipher = Aes256CbcDec::new(enc_key.into(), iv.as_slice().into());
-                let mut buf = ct.clone();
+                let mut buf = zeroize::Zeroizing::new(ct.clone());
                 let decrypted = cipher.decrypt_padded_mut::<Pkcs7>(&mut buf).map_err(|e| {
                     CryptoError::DecryptionFailed(format!("AES CBC decrypt error: {e:?}"))
                 })?;

@@ -59,6 +59,8 @@ fn setup_test_vault() -> (
     let ciphers = vec![
         // p1: GitHub Personal
         CipherResponse {
+            key: None,
+            attachments: None,
             id: "00000000-0000-0000-0000-000000000001".to_string(),
             organization_id: None,
             folder_id: None,
@@ -102,6 +104,8 @@ fn setup_test_vault() -> (
         },
         // p2: Postgres Dev inside Development folder
         CipherResponse {
+            key: None,
+            attachments: None,
             id: "00000000-0000-0000-0000-000000000002".to_string(),
             organization_id: None,
             folder_id: Some("folder-dev".to_string()),
@@ -118,6 +122,8 @@ fn setup_test_vault() -> (
         },
         // p3 & p4: Duplicate items for disambiguation test
         CipherResponse {
+            key: None,
+            attachments: None,
             id: "00000000-0000-0000-0000-000000000003".to_string(),
             organization_id: None,
             folder_id: None,
@@ -133,6 +139,8 @@ fn setup_test_vault() -> (
             fields: None,
         },
         CipherResponse {
+            key: None,
+            attachments: None,
             id: "00000000-0000-0000-0000-000000000004".to_string(),
             organization_id: None,
             folder_id: None,
@@ -149,6 +157,8 @@ fn setup_test_vault() -> (
         },
         // o1: Organization cipher
         CipherResponse {
+            key: None,
+            attachments: None,
             id: "00000000-0000-0000-0000-000000000005".to_string(),
             organization_id: Some("org-uuid-1".to_string()),
             folder_id: None,

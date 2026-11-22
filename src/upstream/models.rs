@@ -118,10 +118,26 @@ pub struct CipherResponse {
     #[serde(rename = "type")]
     pub cipher_type: u8,
     pub name: String,
+    pub key: Option<String>,
     pub notes: Option<String>,
     pub favorite: Option<bool>,
     pub login: Option<CipherLoginResponse>,
     pub fields: Option<Vec<CipherFieldResponse>>,
+    pub attachments: Option<Vec<AttachmentResponse>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentResponse {
+    pub id: String,
+    pub file_name: String,
+    pub key: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AttachmentDownloadResponse {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
