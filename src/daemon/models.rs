@@ -125,5 +125,6 @@ pub struct ListQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListResponse {
     pub items: Vec<crate::resolver::VaultItemSummary>,
+    /// Number of returned entries, including multiple collection memberships per item.
     pub total: usize,
 }

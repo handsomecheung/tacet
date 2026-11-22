@@ -11,6 +11,7 @@ use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A list entry; organization items have one entry per collection membership.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultItemSummary {
     pub id: String,
@@ -105,7 +106,8 @@ impl<'a> VaultResolver<'a> {
         Ok(secret)
     }
 
-    /// Lists vault item summaries with optional scope and search filters.
+    /// Lists one summary per personal item or organization item collection membership.
+    /// Scope and search filters apply to each summary independently.
     pub fn list_items(
         &self,
         scope_filter: Option<&str>,
@@ -165,7 +167,7 @@ impl<'a> VaultResolver<'a> {
                 .as_ref()
                 .and_then(|fid| folder_names.get(fid).cloned());
 
-            let (scope_str, uri_prefix) = if is_personal {
+            let scopes = if is_personal {
                 let enc_name = dec_name.replace('/', "%2F");
                 let scope = match &folder_name {
                     Some(f) => format!("personal/{f}"),
@@ -180,7 +182,7 @@ impl<'a> VaultResolver<'a> {
                 } else {
                     format!("tacet://{prefix}")
                 };
-                (scope, uri_prefix)
+                vec![(scope, uri_prefix)]
             } else {
                 let org_id = cipher.organization_id.as_deref().unwrap_or_default();
                 let org_name = org_names
@@ -188,103 +190,119 @@ impl<'a> VaultResolver<'a> {
                     .cloned()
                     .unwrap_or_else(|| org_id.to_string());
 
-                let col_name = cipher
+                let mut collection_names: Vec<&str> = cipher
                     .collection_ids
-                    .first()
-                    .and_then(|cid| col_names.get(cid))
-                    .cloned()
-                    .unwrap_or_else(|| "default".to_string());
+                    .iter()
+                    .filter_map(|cid| col_names.get(cid).map(String::as_str))
+                    .collect();
+                if collection_names.is_empty() {
+                    collection_names.push("default");
+                }
 
-                let scope = format!("org/{org_name}/{col_name}");
                 let enc_org = org_name.replace('/', "%2F");
                 let enc_name = dec_name.replace('/', "%2F");
-                let prefix = format!("tacet://org/{enc_org}/{col_name}/{enc_name}");
-                (scope, prefix)
+                collection_names
+                    .into_iter()
+                    .map(|col_name| {
+                        let scope = format!("org/{org_name}/{col_name}");
+                        let prefix = format!("tacet://org/{enc_org}/{col_name}/{enc_name}");
+                        (scope, prefix)
+                    })
+                    .collect()
             };
 
-            // Apply scope filter if specified
-            if let Some(scope_req) = scope_filter {
-                let trimmed = scope_req.trim();
-                if !trimmed.is_empty() && trimmed != "*" {
-                    if trimmed.eq_ignore_ascii_case("personal") {
-                        if !is_personal {
-                            continue;
-                        }
-                    } else if let Some(subfolder) = trimmed.strip_prefix("personal/") {
-                        if !is_personal {
-                            continue;
-                        }
-                        match &folder_name {
-                            Some(fn_str) if fn_str.eq_ignore_ascii_case(subfolder) => {}
-                            _ => continue,
-                        }
-                    } else if let Some(org_filter) = trimmed.strip_prefix("org/") {
-                        if is_personal {
-                            continue;
-                        }
-                        if let Some((target_org, target_col)) = org_filter.split_once('/') {
-                            if !scope_str
-                                .eq_ignore_ascii_case(&format!("org/{target_org}/{target_col}"))
+            for (scope_str, uri_prefix) in scopes {
+                // Apply scope filter if specified
+                if let Some(scope_req) = scope_filter {
+                    let trimmed = scope_req.trim();
+                    if !trimmed.is_empty() && trimmed != "*" {
+                        if trimmed.eq_ignore_ascii_case("personal") {
+                            if !is_personal {
+                                continue;
+                            }
+                        } else if let Some(subfolder) = trimmed.strip_prefix("personal/") {
+                            if !is_personal {
+                                continue;
+                            }
+                            match &folder_name {
+                                Some(fn_str) if fn_str.eq_ignore_ascii_case(subfolder) => {}
+                                _ => continue,
+                            }
+                        } else if let Some(org_filter) = trimmed.strip_prefix("org/") {
+                            if is_personal {
+                                continue;
+                            }
+                            if let Some((target_org, target_col)) = org_filter.split_once('/') {
+                                if !scope_str
+                                    .eq_ignore_ascii_case(&format!("org/{target_org}/{target_col}"))
+                                {
+                                    continue;
+                                }
+                            } else if !scope_str
+                                .to_lowercase()
+                                .starts_with(&format!("org/{}", org_filter.to_lowercase()))
                             {
                                 continue;
                             }
-                        } else if !scope_str
-                            .to_lowercase()
-                            .starts_with(&format!("org/{}", org_filter.to_lowercase()))
-                        {
-                            continue;
+                        } else {
+                            let matches_folder = folder_name
+                                .as_ref()
+                                .map(|f| f.eq_ignore_ascii_case(trimmed))
+                                .unwrap_or(false);
+                            let matches_scope = scope_str.eq_ignore_ascii_case(trimmed);
+                            if !matches_folder && !matches_scope {
+                                continue;
+                            }
                         }
-                    } else {
-                        let matches_folder = folder_name
+                    }
+                }
+
+                // Apply search filter if specified
+                if let Some(query) = search_filter {
+                    let q = query.trim().to_lowercase();
+                    if !q.is_empty() {
+                        let name_match = dec_name.to_lowercase().contains(&q);
+                        let id_match = cipher.id.to_lowercase().contains(&q);
+                        let folder_match = folder_name
                             .as_ref()
-                            .map(|f| f.eq_ignore_ascii_case(trimmed))
+                            .map(|f| f.to_lowercase().contains(&q))
                             .unwrap_or(false);
-                        let matches_scope = scope_str.eq_ignore_ascii_case(trimmed);
-                        if !matches_folder && !matches_scope {
+                        let scope_match = scope_str.to_lowercase().contains(&q);
+
+                        if !name_match && !id_match && !folder_match && !scope_match {
                             continue;
                         }
                     }
                 }
-            }
 
-            // Apply search filter if specified
-            if let Some(query) = search_filter {
-                let q = query.trim().to_lowercase();
-                if !q.is_empty() {
-                    let name_match = dec_name.to_lowercase().contains(&q);
-                    let id_match = cipher.id.to_lowercase().contains(&q);
-                    let folder_match = folder_name
-                        .as_ref()
-                        .map(|f| f.to_lowercase().contains(&q))
-                        .unwrap_or(false);
-                    let scope_match = scope_str.to_lowercase().contains(&q);
-
-                    if !name_match && !id_match && !folder_match && !scope_match {
-                        continue;
-                    }
+                let type_str = match cipher.cipher_type {
+                    1 => "Login",
+                    2 => "SecureNote",
+                    3 => "Card",
+                    4 => "Identity",
+                    _ => "Other",
                 }
-            }
+                .to_string();
 
-            let type_str = match cipher.cipher_type {
-                1 => "Login",
-                2 => "SecureNote",
-                3 => "Card",
-                4 => "Identity",
-                _ => "Other",
+                items.push(VaultItemSummary {
+                    id: cipher.id.clone(),
+                    name: dec_name.clone(),
+                    scope: scope_str,
+                    folder: folder_name.clone(),
+                    cipher_type: type_str,
+                    uri_prefix,
+                });
             }
-            .to_string();
-
-            items.push(VaultItemSummary {
-                id: cipher.id.clone(),
-                name: dec_name,
-                scope: scope_str,
-                folder: folder_name,
-                cipher_type: type_str,
-                uri_prefix,
-            });
         }
 
-        items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        items.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.scope.to_lowercase().cmp(&b.scope.to_lowercase()))
+                .then_with(|| a.scope.cmp(&b.scope))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(items)
     }
 

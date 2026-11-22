@@ -26,6 +26,10 @@ For `personal` and `org` scopes, paths are parsed from the end: `<item>/<field>`
 
 `tacet list` and `GET /v1/list` return item URI prefixes with `/` preserved in folder and collection paths, such as `tacet://org/Default/Network/Koishi/Infra/wireproxy`. Append `/password` or another field target to read a secret.
 
+An organization item belonging to multiple collections produces one entry per collection, each with its own `scope` and `uri_prefix`. These entries share the same item `id`. Scope and search filters apply to each entry independently, so filtering by a collection returns only the matching membership. Results are sorted by item name, then scope, then item ID, independently of collection membership order.
+
+`GET /v1/list` reports the number of returned entries in `total`, which can exceed the number of unique item IDs. `tacet list --json` outputs the entries as an array with the same repeated IDs. The table footer distinguishes the two counts, for example `Total: 2 entries (1 unique item)`.
+
 > [!NOTE]
 > Following the **"One Obvious Way"** principle, Tacet strictly uses canonical scope keywords (`personal`, `org`, `*`). Shorthand symbols like `_` are intentionally unsupported to prevent ambiguity in configuration files.
 

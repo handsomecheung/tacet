@@ -302,6 +302,49 @@ fn test_resolve_organization_with_rsa_key() {
 }
 
 #[test]
+fn test_resolve_item_in_multiple_nested_collections() {
+    let (mut vault, user_key, rsa_priv, org_key) = setup_test_vault();
+    let paths = ["Network/Umbilical/Infra", "Network/Koshi/Infra"];
+    vault.collections = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| CollectionResponse {
+            id: format!("col-{index}"),
+            organization_id: "org-uuid-1".to_string(),
+            name: org_key.encrypt_type2_string(path).unwrap(),
+        })
+        .collect();
+    let cipher = vault.ciphers.last_mut().unwrap();
+    cipher.name = org_key.encrypt_type2_string("infra.domains").unwrap();
+    cipher.fields = Some(vec![CipherFieldResponse {
+        name: Some(org_key.encrypt_type2_string("x").unwrap()),
+        value: Some(org_key.encrypt_type2_string("test-value").unwrap()),
+        field_type: Some(0),
+    }]);
+
+    for collection_ids in [vec!["col-0", "col-1"], vec!["col-1", "col-0"]] {
+        vault.ciphers.last_mut().unwrap().collection_ids =
+            collection_ids.into_iter().map(String::from).collect();
+        let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
+
+        for path in paths {
+            for collection in [path.to_string(), path.replace('/', "%2F")] {
+                for field in ["x", "fields/x"] {
+                    assert_eq!(
+                        resolver
+                            .resolve_str(&format!(
+                                "tacet://org/AcmeCorp/{collection}/infra.domains/{field}"
+                            ))
+                            .unwrap(),
+                        "test-value"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_disambiguation_error() {
     let (vault, user_key, rsa_priv, _) = setup_test_vault();
     let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
@@ -414,6 +457,67 @@ fn test_list_items() {
 
     let searched_dup = resolver.list_items(None, Some("Duplicate")).unwrap();
     assert_eq!(searched_dup.len(), 2);
+}
+
+#[test]
+fn test_list_item_in_multiple_nested_collections() {
+    let (mut vault, user_key, rsa_priv, org_key) = setup_test_vault();
+    vault.collections[0].name = org_key
+        .encrypt_type2_string("Network/Umbilical/Infra")
+        .unwrap();
+    vault.collections.push(CollectionResponse {
+        id: "col-koshi".to_string(),
+        organization_id: "org-uuid-1".to_string(),
+        name: org_key.encrypt_type2_string("Network/Koshi/Infra").unwrap(),
+    });
+    vault.ciphers.last_mut().unwrap().collection_ids =
+        vec!["col-backend".to_string(), "col-koshi".to_string()];
+
+    let expected_scopes = [
+        "org/AcmeCorp/Network/Koshi/Infra",
+        "org/AcmeCorp/Network/Umbilical/Infra",
+    ];
+    let listed = {
+        let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
+        assert_eq!(resolver.list_items(None, None).unwrap().len(), 6);
+        let listed = resolver.list_items(Some("org/AcmeCorp"), None).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, listed[1].id);
+        for (entry, scope) in listed.iter().zip(expected_scopes) {
+            assert_eq!(entry.scope, scope);
+            assert_eq!(entry.uri_prefix, format!("tacet://{scope}/Prod Database"));
+            assert_eq!(
+                resolver
+                    .resolve_str(&format!("{}/password", entry.uri_prefix))
+                    .unwrap(),
+                "ultra_secure_prod_password"
+            );
+            assert_eq!(
+                resolver.list_items(Some(scope), None).unwrap(),
+                vec![entry.clone()]
+            );
+        }
+        assert_eq!(
+            resolver.list_items(None, Some("koshi")).unwrap(),
+            vec![listed[0].clone()]
+        );
+        assert_eq!(
+            resolver.list_items(None, Some("Prod Database")).unwrap(),
+            listed
+        );
+        assert!(resolver
+            .list_items(Some("org/AcmeCorp/Network/Other/Infra"), None)
+            .unwrap()
+            .is_empty());
+        listed
+    };
+
+    vault.ciphers.last_mut().unwrap().collection_ids.reverse();
+    let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
+    assert_eq!(
+        resolver.list_items(Some("org/AcmeCorp"), None).unwrap(),
+        listed
+    );
 }
 
 #[test]

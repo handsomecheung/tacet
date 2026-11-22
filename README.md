@@ -115,6 +115,8 @@ tacet list --json
 
 Listed URI prefixes preserve `/` in nested folder and collection paths. Append a field target such as `/password` to read a secret.
 
+Organization items appear once per collection membership, with a scope and URI prefix for each collection. Scope and search filters apply to each entry separately. JSON output uses the same entries, so an item in multiple collections has multiple records with the same `id`. The table footer reports both the number of entries and the number of unique items, for example `Total: 2 entries (1 unique item)`.
+
 ### 4. Read a Secret
 Fetch a single secret to standard output:
 

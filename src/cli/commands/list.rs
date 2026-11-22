@@ -1,4 +1,5 @@
 use crate::daemon::DaemonClient;
+use std::collections::HashSet;
 use std::error::Error;
 
 pub async fn execute_list(
@@ -98,6 +99,17 @@ pub async fn execute_list(
         );
     }
 
-    println!("\nTotal: {} item(s)", resp.total);
+    let unique_items = resp
+        .items
+        .iter()
+        .map(|item| &item.id)
+        .collect::<HashSet<_>>()
+        .len();
+    let entry_label = if resp.total == 1 { "entry" } else { "entries" };
+    let item_label = if unique_items == 1 { "item" } else { "items" };
+    println!(
+        "\nTotal: {} {entry_label} ({} unique {item_label})",
+        resp.total, unique_items
+    );
     Ok(())
 }

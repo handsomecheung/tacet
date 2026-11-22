@@ -171,6 +171,8 @@ All cryptographic operations strictly adhere to the Bitwarden Cryptographic Spec
 | `POST /v1/resolve` | `{"uris": [string]}` | `{"secrets": {string: string}}` | 400, 401, 404, 409 | Batch secret resolution |
 | `GET /v1/list` | None (Query: `?scope=..&search=..`) | `{"items": [{"id": "..", "name": "..", "scope": "..", "folder": "..", "cipher_type": "..", "uri_prefix": ".."}], "total": usize}` | 401, 500 | Lists item summaries with decrypted names |
 
+For `GET /v1/list`, organization items produce one entry per collection membership, with the same item `id` and a collection-specific `scope` and `uri_prefix`. Scope and search filters apply to each entry independently. `total` counts returned entries, not unique items. Entries are sorted by item name, then scope, then item ID. `tacet list --json` outputs the same entries as an array; the table footer reports both entry and unique item counts.
+
 ---
 
 ## 5. CLI Execution & Safety Guarantees

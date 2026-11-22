@@ -5,7 +5,10 @@ use tacet::cli::masker::StreamMasker;
 use tacet::crypto::symmetric_key::SymmetricKey;
 use tacet::daemon::{bind_unix_socket, run_server, DaemonClient, DaemonState};
 use tacet::storage::StoragePaths;
-use tacet::upstream::models::{CipherLoginResponse, CipherResponse, ProfileResponse, SyncResponse};
+use tacet::upstream::models::{
+    CipherLoginResponse, CipherResponse, CollectionResponse, ProfileOrganizationResponse,
+    ProfileResponse, SyncResponse,
+};
 use tempfile::tempdir;
 use tokio::sync::broadcast;
 
@@ -186,6 +189,107 @@ async fn test_cli_list() {
 
     let _ = shutdown_tx.send(());
     let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_cli_list_multiple_collections() {
+    let tmp = tempdir().unwrap();
+    let socket_path = tmp.path().join("list.sock");
+    let storage_paths = StoragePaths::custom(tmp.path().join("cfg"), tmp.path().join("cache"));
+    let user_key = SymmetricKey::new([33u8; 64]);
+    let org_key = SymmetricKey::new([44u8; 64]);
+    let vault = SyncResponse {
+        profile: Some(ProfileResponse {
+            id: "u1".to_string(),
+            name: None,
+            email: "test@example.com".to_string(),
+            key: None,
+            private_key: None,
+            organizations: vec![ProfileOrganizationResponse {
+                id: "org-1".to_string(),
+                name: "Default".to_string(),
+                key: Some(user_key.encrypt_type2(org_key.as_bytes()).unwrap()),
+            }],
+        }),
+        folders: vec![],
+        collections: ["Network/Umbilical/Infra", "Network/Koshi/Infra"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| CollectionResponse {
+                id: format!("col-{index}"),
+                organization_id: "org-1".to_string(),
+                name: org_key.encrypt_type2_string(name).unwrap(),
+            })
+            .collect(),
+        ciphers: vec![CipherResponse {
+            id: "22222222-2222-2222-2222-222222222222".to_string(),
+            organization_id: Some("org-1".to_string()),
+            folder_id: None,
+            collection_ids: vec!["col-0".to_string(), "col-1".to_string()],
+            cipher_type: 1,
+            name: org_key.encrypt_type2_string("infra.domains").unwrap(),
+            notes: None,
+            favorite: None,
+            login: None,
+            fields: None,
+        }],
+    };
+
+    let listener = bind_unix_socket(&socket_path).await.unwrap();
+    let state = DaemonState::new(storage_paths, Duration::from_secs(1800));
+    *state.symmetric_key.write().await = Some(user_key);
+    *state.vault.write().await = Some(vault);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server_handle = tokio::spawn(async move {
+        run_server(listener, state, shutdown_rx).await.unwrap();
+    });
+
+    let client = DaemonClient::new(&socket_path);
+    let response = client.list(None, None).await.unwrap();
+    assert_eq!(response.total, 2);
+    assert_eq!(response.items[0].id, response.items[1].id);
+    for (args, expected_footer, expected_count) in [
+        (vec![], "Total: 2 entries (1 unique item)", 2),
+        (
+            vec!["org/Default/Network/Koshi/Infra"],
+            "Total: 1 entry (1 unique item)",
+            1,
+        ),
+    ] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tacet"))
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("list")
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let table = String::from_utf8(output.stdout).unwrap();
+        assert!(table.contains(expected_footer), "{table}");
+        assert!(table.contains("tacet://org/Default/Network/Koshi/Infra/infra.domains"));
+        assert_eq!(
+            table.contains("Network/Umbilical/Infra"),
+            expected_count == 2
+        );
+
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tacet"))
+            .arg("--socket")
+            .arg(&socket_path)
+            .args(["list", "--json"])
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let entries: Vec<tacet::resolver::VaultItemSummary> =
+            serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(entries.len(), expected_count);
+        assert_eq!(entries, response.items[..expected_count]);
+    }
+
+    let _ = shutdown_tx.send(());
+    server_handle.await.unwrap();
 }
 
 #[tokio::test]
