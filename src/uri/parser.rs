@@ -83,23 +83,12 @@ pub enum Encoding {
     Hex,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Modifiers {
     pub encoding: Option<Encoding>,
     pub json: Option<String>,
     pub trim: bool,
     pub trim_explicit: bool,
-}
-
-impl Default for Modifiers {
-    fn default() -> Self {
-        Self {
-            encoding: None,
-            json: None,
-            trim: true,
-            trim_explicit: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

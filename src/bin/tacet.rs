@@ -50,7 +50,7 @@ async fn main() {
             search,
             json,
         } => execute_list(&client, scope, search, json).await,
-        Commands::Read { uri, no_newline } => execute_read(&client, uri, no_newline).await,
+        Commands::Read { uri } => execute_read(&client, uri).await,
         Commands::Inject { input, output } => execute_inject(&client, input, output).await,
         Commands::Run {
             env_file,

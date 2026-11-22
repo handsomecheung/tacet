@@ -77,14 +77,10 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Print a secret field or write attachment bytes to stdout
+    /// Write a secret field or attachment to stdout without adding a newline
     Read {
         /// Target secret URI (e.g. tacet://personal/github/password)
         uri: String,
-
-        /// Do not print trailing newline
-        #[arg(short = 'n', long = "no-newline")]
-        no_newline: bool,
     },
 
     /// Render {{ tacet://... }} placeholders (supports stdin/stdout)

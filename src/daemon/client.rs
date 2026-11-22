@@ -145,7 +145,7 @@ impl DaemonClient {
             .await
     }
 
-    /// Reads a field or attachment as bytes, retaining the kind for CLI newline handling.
+    /// Reads a field or attachment as bytes, retaining the value kind returned by the daemon.
     pub async fn read(&self, uri: &str) -> Result<ReadResponse, DaemonClientError> {
         let (headers, bytes) = self
             .send_raw(

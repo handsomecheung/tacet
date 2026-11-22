@@ -140,7 +140,7 @@ tacet read "tacet://personal/Server/files/example.exe" > example.exe
 tacet read "tacet://personal/Server/files/example.exe?encoding=base64" > example.exe.b64
 ```
 
-Field reads append a newline unless `--no-newline` is set. Attachment reads never append a newline, including encoded reads, and preserve all original whitespace and binary bytes. Diagnostics go to stderr. Redirected files are created or truncated by the shell before Tacet runs; their permissions follow your shell's `umask`. Parent directories must already exist.
+All reads write the resolved value without appending a newline, including encoded reads. The former `--no-newline` (`-n`) option has been removed because this is now the default behavior. Field reads preserve original whitespace by default (`trim=false`); use `?trim=true` to remove leading and trailing whitespace. Attachment reads preserve all original whitespace and binary bytes. Diagnostics go to stderr. Redirected files are created or truncated by the shell before Tacet runs; their permissions follow your shell's `umask`. Parent directories must already exist.
 
 Attachments require an unlocked vault and an online server. After upgrading from a version without attachment support, run `tacet sync` to refresh cached attachment metadata. Downloads are verified before any contents are returned. The initial implementation buffers encrypted files in memory, limits each encrypted download to 64 MiB, and supports authenticated Type 2 attachment payloads, including legacy attachments without a dedicated key and modern attachments using item keys. Larger files and other payload formats return an error.
 
@@ -229,9 +229,9 @@ Unqualified targets match a built-in field first, then a custom field, then an a
 - `encoding=base64`: Encode multi-line secrets or binary values into base64.
 - `encoding=hex`: Encode value as lowercase hexadecimal string.
 - `json=<dot.path>`: Parse JSON payload and extract field (e.g., `?json=credentials.client_secret`).
-- `trim=true|false`: Strip leading/trailing whitespace and newlines (default: `true`).
+- `trim=true|false`: Strip leading/trailing whitespace and newlines when `true` (default: `false`).
 
-For attachments, `encoding=base64` and `encoding=hex` operate on the original bytes. The default trimming behavior does not apply. Explicit `trim` and `json` modifiers are rejected. Attachment references are supported by `tacet read`; `inject` and `run` continue to accept text fields only.
+For attachments, `encoding=base64` and `encoding=hex` operate on the original bytes. Trimming does not apply. Explicit `trim` and `json` modifiers are rejected. Attachment references are supported by `tacet read`; `inject` and `run` continue to accept text fields only.
 
 ---
 
@@ -261,7 +261,7 @@ tacet sync
 tacet list [scope] [-q <query>] [--json]
 
 # Output a secret field or attachment bytes
-tacet read <uri> [--no-newline]
+tacet read <uri>
 
 # Inject into file templates
 tacet inject [-i <template_file>] [-o <output_file>]

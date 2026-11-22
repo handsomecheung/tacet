@@ -67,11 +67,13 @@ Bitwarden item fields are accessed strictly via standardized canonical names or 
 
 ### 4. Query Modifier Patterns (`?<modifiers>`)
 
+Text field values preserve leading and trailing whitespace by default. `tacet read` writes the resolved value without appending a newline.
+
 Modifiers allow on-the-fly transformations of the extracted secret. Modifiers can be combined using `&` (e.g. `?encoding=base64&trim=false`).
 
 #### Pipeline Order:
 1. `json` extraction
-2. `trim` whitespace strip
+2. `trim` whitespace strip (only when explicitly enabled)
 3. `encoding` transformation
 
 | Modifier | Parameter Syntax | Description | Example |
@@ -79,7 +81,7 @@ Modifiers allow on-the-fly transformations of the extracted secret. Modifiers ca
 | **JSON Extraction** | `json=<dot.path>` | Parses the secret as JSON and extracts the value at the specified dot-separated path | `tacet://personal/GCP_ServiceAccount/notes?json=private_key` |
 | **Base64 Encoding** | `encoding=base64` | Encodes the resolved string to standard Base64 | `tacet://personal/K8s/cert?encoding=base64` |
 | **Hex Encoding** | `encoding=hex` | Encodes the resolved string to lowercase hexadecimal | `tacet://personal/Auth/secret?encoding=hex` |
-| **Whitespace Trim** | `trim=true` / `trim=1`<br>`trim=false` / `trim=0` | Strips leading/trailing whitespace and newlines (default is `true`) | `tacet://personal/TLS/ca.crt?trim=false` |
+| **Whitespace Trim** | `trim=true` / `trim=1`<br>`trim=false` / `trim=0` | Strips leading/trailing whitespace and newlines when enabled (default is `false`) | `tacet://personal/TLS/ca.crt?trim=true` |
 
 ---
 
@@ -95,7 +97,7 @@ Modifiers allow on-the-fly transformations of the extracted secret. Modifiers ca
   tacet://org/AcmeCorp/Engineering/Backend/Database/fields/replica_password
   ```
 
-* **Multi-line certificate keeping original trailing newlines:**
+* **Multi-line certificate keeping original trailing newlines by default:**
   ```text
-  tacet://personal/Certificates/RootCA/notes?trim=false
+  tacet://personal/Certificates/RootCA/notes
   ```

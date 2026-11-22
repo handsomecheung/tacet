@@ -776,7 +776,7 @@ impl<'a> VaultResolver<'a> {
             val = extract_json_path(&val, dot_path)?;
         }
 
-        // 2. Whitespace trimming (default true)
+        // 2. Whitespace trimming (opt-in)
         if uri.modifiers.trim {
             val = val.trim().to_string();
         }

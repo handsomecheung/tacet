@@ -421,16 +421,23 @@ fn test_modifiers() {
         .unwrap();
     assert_eq!(hex, "616c696365"); // "alice" in hex
 
-    // 4. Trim modifier
+    // 4. Preserve whitespace by default; trim only when requested.
+    let original = "-----BEGIN CERTIFICATE-----\nMIIB...\n";
+    assert_eq!(
+        resolver
+            .resolve_str("tacet://org/AcmeCorp/Backend/Prod Database/notes")
+            .unwrap(),
+        original
+    );
     let untrimmed = resolver
         .resolve_str("tacet://org/AcmeCorp/Backend/Prod Database/notes?trim=false")
         .unwrap();
-    assert!(untrimmed.ends_with('\n'));
+    assert_eq!(untrimmed, original);
 
     let trimmed = resolver
         .resolve_str("tacet://org/AcmeCorp/Backend/Prod Database/notes?trim=true")
         .unwrap();
-    assert!(!trimmed.ends_with('\n'));
+    assert_eq!(trimmed, original.trim());
 }
 
 #[test]

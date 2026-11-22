@@ -150,7 +150,7 @@ fn test_parse_field_variants() {
 fn test_parse_modifiers() {
     let uri1 = TacetUri::parse("tacet://personal/item/notes?encoding=base64").unwrap();
     assert_eq!(uri1.modifiers.encoding, Some(Encoding::Base64));
-    assert!(uri1.modifiers.trim);
+    assert!(!uri1.modifiers.trim);
 
     let uri2 = TacetUri::parse("tacet://personal/item/notes?encoding=hex&trim=false").unwrap();
     assert_eq!(uri2.modifiers.encoding, Some(Encoding::Hex));
@@ -158,7 +158,7 @@ fn test_parse_modifiers() {
 
     let uri3 = TacetUri::parse("tacet://personal/item/notes?json=database.password").unwrap();
     assert_eq!(uri3.modifiers.json.as_deref(), Some("database.password"));
-    assert!(uri3.modifiers.trim);
+    assert!(!uri3.modifiers.trim);
 }
 
 #[test]

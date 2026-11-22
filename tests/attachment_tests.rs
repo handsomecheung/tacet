@@ -423,11 +423,32 @@ async fn cli_binary_output_metadata_and_text_compatibility() {
         .await;
     assert!(out.status.success());
     assert_eq!(out.stdout, BASE64.encode(ORIGINAL).as_bytes());
-    for (extra, expected) in [
-        (vec![], b"field-password\n".as_slice()),
-        (vec!["-n"], b"field-password".as_slice()),
+    for (target, expected) in [
+        ("password", b"field-password".as_slice()),
+        ("fields/config.yml", b"".as_slice()),
     ] {
-        let out = h.cli("tacet://personal/Server/password", &extra).await;
+        let out = h
+            .cli(&format!("tacet://personal/Server/{target}"), &[])
+            .await;
+        assert!(out.status.success());
+        assert_eq!(out.stdout, expected);
+    }
+    {
+        let mut vault = h.state.vault.write().await;
+        vault.as_mut().unwrap().ciphers[0].notes = Some(
+            SymmetricKey::new([20; 64])
+                .encrypt_type2_string(" \tfirst\nsecond\r\n\n")
+                .unwrap(),
+        );
+    }
+    for (target, expected) in [
+        ("notes", b" \tfirst\nsecond\r\n\n".as_slice()),
+        ("notes?trim=false", b" \tfirst\nsecond\r\n\n".as_slice()),
+        ("notes?trim=true", b"first\nsecond".as_slice()),
+    ] {
+        let out = h
+            .cli(&format!("tacet://personal/Server/{target}"), &[])
+            .await;
         assert!(out.status.success());
         assert_eq!(out.stdout, expected);
     }
