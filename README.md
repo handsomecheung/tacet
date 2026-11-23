@@ -147,27 +147,35 @@ Attachments require an unlocked vault and an online server. After upgrading from
 If a newly added item is missing from `list`, or an attachment lookup returns 404, refresh the cache with `tacet sync`. Older cache files may contain items without their attachment metadata. If syncing fails with an upstream 401, repeat your usual `tacet login` command to obtain a valid session; unlocking alone does not renew an expired access token. Then retry syncing and reading the attachment. A successful sync does not resolve a 404 caused by an incorrect reference or an attachment that was deleted upstream.
 
 ### 5. Template Injection
-Replace `{{ tacet://... }}` placeholders in configuration templates without writing secrets to disk:
+Replace `{{ tacet://... }}` placeholders in configuration templates and write the rendered result to a file or stdout:
 
 ```bash
 # Render template file to destination
 tacet inject -i config.template.json -o config.json
+
+# Replace a single template file in place
+tacet inject -i config.env --in-place
 
 # Stdin / Stdout pipeline
 cat template.env | tacet inject > .env
 
 # Recursively render a directory into another directory
 tacet inject --in-dir ./templates --out-dir ./rendered
+
+# Replace templates in the input directory in place
+tacet inject --in-dir ./configs --in-place
 ```
 
-Directory mode (`--in-dir` / `--out-dir`, which cannot be combined with `-i`/`-o`):
+Directory mode (`--in-dir` with exactly one of `--out-dir` or `--in-place`, which cannot be combined with `-i`/`-o`):
 
 - Mirrors the input structure; only files containing placeholders are written. Add `--copy-all` to also copy all other files (including binary ones) unchanged.
 - Symlinks are skipped, and non-UTF-8 files are skipped unless `--copy-all` is given.
 - `--out-dir` must not be inside `--in-dir`.
-- If any output file already exists the command fails before writing anything; pass `--force` to overwrite.
+- With `--out-dir`, if any output file already exists the command fails before writing anything; pass `--force` to overwrite.
 - All URIs are resolved in one batch first; any failure aborts without writing files.
 - Output files are created with mode `0600` and new directories with `0700`.
+
+With `--in-place`, specify exactly one input: `-i <file>` (or `--in <file>`) or `--in-dir <directory>`; stdin is not supported. Only files containing placeholders are replaced; all other files and existing directories remain unchanged. Symlinks are skipped, including dangling symlinks. Non-UTF-8 files are skipped in directory mode; an explicitly selected non-UTF-8 file returns an error without changes. Updated files have mode `0600`, regardless of their previous permissions. `--in-place` authorizes overwriting without `--force` and cannot be combined with `-o`/`--out`, `--out-dir`, `--force`, or `--copy-all`. All URIs are resolved before any files are changed. Each file is replaced atomically using a temporary file in the same directory, but a write failure in directory mode can leave some files updated and others unchanged. Original placeholders are lost after replacement, so rerunning the command does not refresh previously injected secrets.
 
 ### 6. Run Commands with Secret Injection
 Pass secrets directly into environment variables with real-time output redaction:
@@ -277,6 +285,8 @@ tacet read <uri>
 
 # Inject into file templates
 tacet inject [-i <template_file>] [-o <output_file>]
+tacet inject -i <template_file> --in-place
+tacet inject --in-dir <directory> (--out-dir <directory> [--force] [--copy-all] | --in-place)
 
 # Execute process with injected environment variables
 tacet run [--env-file <file>] [--no-mask] -- <command> [args...]

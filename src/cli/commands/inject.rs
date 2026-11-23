@@ -23,36 +23,8 @@ pub async fn execute_inject(
         }
     };
 
-    // 2. Extract placeholders: {{ tacet://... }}
-    let re = Regex::new(PLACEHOLDER_PATTERN)?;
-    let mut uris_set = HashSet::new();
-    for cap in re.captures_iter(&content) {
-        if let Some(matched_uri) = cap.get(1) {
-            uris_set.insert(matched_uri.as_str().to_string());
-        }
-    }
+    let rendered = render_template(client, &content).await?.unwrap_or(content);
 
-    let rendered = if uris_set.is_empty() {
-        content
-    } else {
-        let uris: Vec<String> = uris_set.into_iter().collect();
-
-        // 3. Fail-Fast Guarantee: Batch resolve all URIs; abort if any fail
-        let resolve_resp = client.resolve(uris).await?;
-
-        // 4. Replace placeholders with resolved secrets
-        re.replace_all(&content, |caps: &regex::Captures| {
-            let uri = &caps[1];
-            resolve_resp
-                .secrets
-                .get(uri)
-                .cloned()
-                .unwrap_or_else(|| caps[0].to_string())
-        })
-        .to_string()
-    };
-
-    // 5. Write output
     match output {
         Some(path) => {
             fs::write(path, rendered)?;
@@ -64,6 +36,56 @@ pub async fn execute_inject(
     }
 
     Ok(())
+}
+
+/// Replace a single template atomically, skipping symlinks and files without placeholders.
+pub async fn execute_inject_file_in_place(
+    client: &DaemonClient,
+    input: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_type = fs::symlink_metadata(&input)?.file_type();
+    if file_type.is_symlink() {
+        return Ok(());
+    }
+    if !file_type.is_file() {
+        return Err(format!("input is not a regular file: {}", input.display()).into());
+    }
+    let input = input.canonicalize()?;
+    let content = fs::read_to_string(&input)?;
+    if let Some(rendered) = render_template(client, &content).await? {
+        write_private_file(&input, rendered.as_bytes(), true)?;
+    }
+    Ok(())
+}
+
+/// Resolve all references before returning rendered text; `None` means no placeholders.
+async fn render_template(
+    client: &DaemonClient,
+    content: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let re = Regex::new(PLACEHOLDER_PATTERN)?;
+    let mut uris_set = HashSet::new();
+    for cap in re.captures_iter(content) {
+        if let Some(matched_uri) = cap.get(1) {
+            uris_set.insert(matched_uri.as_str().to_string());
+        }
+    }
+
+    if uris_set.is_empty() {
+        return Ok(None);
+    }
+
+    let resolve_resp = client.resolve(uris_set.into_iter().collect()).await?;
+    Ok(Some(
+        re.replace_all(content, |caps: &regex::Captures| {
+            resolve_resp
+                .secrets
+                .get(&caps[1])
+                .cloned()
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .into_owned(),
+    ))
 }
 
 /// A file discovered while walking the input directory.
@@ -145,12 +167,12 @@ fn write_private_file(path: &Path, data: &[u8], force: bool) -> io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tmp = parent.join(format!(".{name}.tacet-tmp-{}", std::process::id()));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
     let result = (|| {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
         fs::rename(&tmp, path)
@@ -169,14 +191,38 @@ pub async fn execute_inject_dir(
     force: bool,
     copy_all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    render_inject_dir(client, in_dir, Some(out_dir), force, copy_all).await
+}
+
+/// Replace templates under `in_dir` with rendered files, leaving other files untouched.
+pub async fn execute_inject_dir_in_place(
+    client: &DaemonClient,
+    in_dir: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    render_inject_dir(client, in_dir, None, true, false).await
+}
+
+async fn render_inject_dir(
+    client: &DaemonClient,
+    in_dir: PathBuf,
+    out_dir: Option<PathBuf>,
+    force: bool,
+    copy_all: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !in_dir.is_dir() {
         return Err(format!("input is not a directory: {}", in_dir.display()).into());
     }
     let in_abs = in_dir.canonicalize()?;
-    let out_abs = absolute_resolved(&out_dir)?;
-    if out_abs.starts_with(&in_abs) {
-        return Err("output directory must not be inside the input directory".into());
-    }
+    let out_abs = match out_dir {
+        Some(path) => {
+            let out_abs = absolute_resolved(&path)?;
+            if out_abs.starts_with(&in_abs) {
+                return Err("output directory must not be inside the input directory".into());
+            }
+            out_abs
+        }
+        None => in_abs.clone(),
+    };
 
     // 1. Discover files
     let re = Regex::new(PLACEHOLDER_PATTERN)?;

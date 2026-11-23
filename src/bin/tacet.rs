@@ -1,7 +1,8 @@
 use clap::Parser;
 use tacet::cli::commands::{
-    execute_inject, execute_inject_dir, execute_list, execute_lock, execute_login, execute_logout,
-    execute_read, execute_run, execute_status, execute_sync, execute_unlock,
+    execute_inject, execute_inject_dir, execute_inject_dir_in_place, execute_inject_file_in_place,
+    execute_list, execute_lock, execute_login, execute_logout, execute_read, execute_run,
+    execute_status, execute_sync, execute_unlock,
 };
 use tacet::cli::{ensure_daemon_running, Cli, Commands};
 use tacet::daemon::default_socket_path;
@@ -56,11 +57,16 @@ async fn main() {
             output,
             in_dir,
             out_dir,
+            in_place,
             force,
             copy_all,
-        } => match (in_dir, out_dir) {
-            (Some(i), Some(o)) => execute_inject_dir(&client, i, o, force, copy_all).await,
-            _ => execute_inject(&client, input, output).await,
+        } => match (input, in_dir, out_dir, in_place) {
+            (Some(i), None, None, true) => execute_inject_file_in_place(&client, i).await,
+            (None, Some(i), None, true) => execute_inject_dir_in_place(&client, i).await,
+            (None, Some(i), Some(o), false) => {
+                execute_inject_dir(&client, i, o, force, copy_all).await
+            }
+            (input, _, _, _) => execute_inject(&client, input, output).await,
         },
         Commands::Run {
             env_file,

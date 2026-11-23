@@ -86,20 +86,33 @@ pub enum Commands {
     /// Render {{ tacet://... }} placeholders (supports stdin/stdout)
     Inject {
         /// Template input file (reads from stdin if omitted)
-        #[arg(short = 'i', long = "in", conflicts_with_all = ["in_dir", "out_dir"])]
+        #[arg(short = 'i', long = "in", group = "in_place_input", conflicts_with_all = ["in_dir", "out_dir"])]
         input: Option<PathBuf>,
 
-        /// Destination output file (writes to stdout if omitted)
+        /// Destination output file (stdout by default; conflicts with --in-place)
         #[arg(short = 'o', long = "out", conflicts_with_all = ["in_dir", "out_dir"])]
         output: Option<PathBuf>,
 
-        /// Recursively render all files under this directory (requires --out-dir)
-        #[arg(long = "in-dir", requires = "out_dir")]
+        /// Recursively render templates (requires --out-dir or --in-place)
+        #[arg(
+            long = "in-dir",
+            group = "in_place_input",
+            requires = "directory_output"
+        )]
         in_dir: Option<PathBuf>,
 
         /// Destination directory mirroring the input structure (requires --in-dir)
-        #[arg(long = "out-dir", requires = "in_dir")]
+        #[arg(long = "out-dir", requires = "in_dir", group = "directory_output")]
         out_dir: Option<PathBuf>,
+
+        /// Replace templates from --in or --in-dir in place (mode 0600)
+        #[arg(
+            long = "in-place",
+            requires = "in_place_input",
+            group = "directory_output",
+            conflicts_with_all = ["output", "force", "copy_all"]
+        )]
+        in_place: bool,
 
         /// Overwrite existing output files in --out-dir
         #[arg(long, requires = "out_dir")]
