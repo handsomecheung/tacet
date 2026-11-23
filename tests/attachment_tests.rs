@@ -31,6 +31,7 @@ fn blob(key: &SymmetricKey, plaintext: &[u8]) -> Vec<u8> {
 fn vault(user: &SymmetricKey, item: &SymmetricKey, content: &SymmetricKey) -> SyncResponse {
     SyncResponse {
         ciphers: vec![CipherResponse {
+            deleted_date: None,
             id: ITEM_ID.into(),
             organization_id: None,
             folder_id: None,

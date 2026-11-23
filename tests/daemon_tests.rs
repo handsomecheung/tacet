@@ -4,7 +4,9 @@ use std::time::Duration;
 use tacet::crypto::cipher_string::CipherString;
 use tacet::crypto::kdf::{derive_master_key, stretch_master_key, KdfParams};
 use tacet::crypto::symmetric_key::SymmetricKey;
-use tacet::daemon::{bind_unix_socket, run_server, DaemonClient, DaemonState, LoginRequest};
+use tacet::daemon::{
+    bind_unix_socket, run_server, DaemonClient, DaemonClientError, DaemonState, LoginRequest,
+};
 use tacet::storage::StoragePaths;
 use tempfile::tempdir;
 use tokio::sync::broadcast;
@@ -118,6 +120,25 @@ async fn test_daemon_full_rest_lifecycle() {
         .encrypt_type2_string("JBSWY3DPEHPK3PXP")
         .unwrap();
 
+    let active_cipher = json!({
+        "id": "11111111-1111-1111-1111-111111111111",
+        "type": 1,
+        "name": enc_cipher_name,
+        "login": {
+            "password": enc_cipher_pass,
+            "totp": enc_cipher_totp
+        }
+    });
+    let mut archived_cipher = active_cipher.clone();
+    archived_cipher["id"] = json!("22222222-2222-2222-2222-222222222222");
+    archived_cipher["name"] = json!(user_sym_key
+        .encrypt_type2_string("Archived API Key")
+        .unwrap());
+    archived_cipher["archivedDate"] = json!("2026-11-01T00:00:00Z");
+    let mut trashed_cipher = active_cipher.clone();
+    trashed_cipher["id"] = json!("33333333-3333-3333-3333-333333333333");
+    trashed_cipher["deletedDate"] = json!("2026-11-01T00:00:00Z");
+
     Mock::given(method("GET"))
         .and(path("/api/sync"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -130,23 +151,7 @@ async fn test_daemon_full_rest_lifecycle() {
             },
             "folders": [],
             "collections": [],
-            "ciphers": [
-                {
-                    "id": "11111111-1111-1111-1111-111111111111",
-                    "organizationId": null,
-                    "folderId": null,
-                    "type": 1,
-                    "name": enc_cipher_name,
-                    "notes": null,
-                    "login": {
-                        "username": null,
-                        "password": enc_cipher_pass,
-                        "totp": enc_cipher_totp,
-                        "uris": null
-                    },
-                    "fields": null
-                }
-            ]
+            "ciphers": [active_cipher, archived_cipher, trashed_cipher]
         })))
         .mount(&mock_server)
         .await;
@@ -179,13 +184,13 @@ async fn test_daemon_full_rest_lifecycle() {
     let login_req = LoginRequest::password(mock_server.uri(), email, password);
     let login_resp = client.login(&login_req).await.expect("Login failed");
     assert!(login_resp.unlocked);
-    assert_eq!(login_resp.item_count, 1);
+    assert_eq!(login_resp.item_count, 2);
 
     // Verify status after login
     let status_logged_in = client.status().await.unwrap();
     assert!(status_logged_in.logged_in);
     assert!(status_logged_in.unlocked);
-    assert_eq!(status_logged_in.item_count, 1);
+    assert_eq!(status_logged_in.item_count, 2);
 
     // D. Resolve secret while unlocked
     let resolve_resp = client
@@ -247,13 +252,43 @@ async fn test_daemon_full_rest_lifecycle() {
     // G. Sync
     let sync_resp = client.sync().await.expect("Sync failed");
     assert!(sync_resp.synced);
-    assert_eq!(sync_resp.item_count, 1);
+    assert_eq!(sync_resp.item_count, 2);
 
     // Test list endpoint
     let list_resp = client.list(None, None).await.expect("List failed");
-    assert_eq!(list_resp.total, 1);
-    assert_eq!(list_resp.items[0].name, "Production API Key");
+    assert_eq!(list_resp.total, 2);
+    assert_eq!(list_resp.items[0].name, "Archived API Key");
+    assert_eq!(list_resp.items[1].name, "Production API Key");
     assert_eq!(list_resp.items[0].cipher_type, "Login");
+
+    let archived_uri = "tacet://personal/Archived API Key/password";
+    let archived = client.resolve(vec![archived_uri.into()]).await.unwrap();
+    assert_eq!(archived.secrets[archived_uri], "sk-live-secret-42");
+    let archived_id = "22222222-2222-2222-2222-222222222222";
+    assert!(client
+        .read(&format!("tacet://*/{archived_id}/password"))
+        .await
+        .is_ok());
+    assert!(client.attachments(archived_id).await.is_ok());
+
+    let trashed_id = "33333333-3333-3333-3333-333333333333";
+    let uri = format!("tacet://*/{trashed_id}/password");
+    for error in [
+        client.resolve(vec![uri.clone()]).await.unwrap_err(),
+        client
+            .read(&uri)
+            .await
+            .err()
+            .expect("Trashed item was read"),
+        client.attachments(trashed_id).await.unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            DaemonClientError::HttpStatus { status, .. } if status.as_u16() == 404
+        ));
+    }
+    let cache = tacet::storage::vault_cache::EncryptedVaultCache::load(&storage_paths).unwrap();
+    assert_eq!(cache.item_count(), 2);
 
     // H. Logout
     let logout_resp = client.logout().await.expect("Logout failed");

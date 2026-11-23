@@ -197,6 +197,7 @@ async fn test_cli_inject_and_fail_fast() {
         folders: vec![],
         collections: vec![],
         ciphers: vec![CipherResponse {
+            deleted_date: None,
             key: None,
             attachments: None,
             id: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -524,6 +525,7 @@ async fn test_cli_list() {
         folders: vec![],
         collections: vec![],
         ciphers: vec![CipherResponse {
+            deleted_date: None,
             key: None,
             attachments: None,
             id: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -595,6 +597,7 @@ async fn test_cli_list_multiple_collections() {
             })
             .collect(),
         ciphers: vec![CipherResponse {
+            deleted_date: None,
             key: None,
             attachments: None,
             id: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -683,6 +686,7 @@ async fn test_cli_run_environment_injection_and_masking() {
         folders: vec![],
         collections: vec![],
         ciphers: vec![CipherResponse {
+            deleted_date: None,
             key: None,
             attachments: None,
             id: "33333333-3333-3333-3333-333333333333".to_string(),

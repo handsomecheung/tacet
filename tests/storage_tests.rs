@@ -89,6 +89,7 @@ fn test_vault_cache_lifecycle_and_permissions() {
         collections: vec![],
         ciphers: vec![
             CipherResponse {
+                deleted_date: None,
                 key: None,
                 attachments: None,
                 id: "c1".to_string(),
@@ -103,6 +104,7 @@ fn test_vault_cache_lifecycle_and_permissions() {
                 fields: None,
             },
             CipherResponse {
+                deleted_date: None,
                 key: None,
                 attachments: None,
                 id: "c2".to_string(),
@@ -145,4 +147,46 @@ fn test_vault_cache_lifecycle_and_permissions() {
     // Clear cache
     EncryptedVaultCache::clear(&paths).expect("Clear cache failed");
     assert!(!EncryptedVaultCache::exists(&paths));
+}
+
+#[test]
+fn test_cached_trash_is_excluded_and_archived_items_remain_available() {
+    let tmp = tempdir().unwrap();
+    let paths = StoragePaths::custom(tmp.path().join("config"), tmp.path().join("cache"));
+    paths.ensure_dirs().unwrap();
+    let cache = serde_json::json!({
+        "updated_at": Utc::now(),
+        "data": {
+            "ciphers": [
+                {"id": "active", "type": 1, "name": "2.iv|name|mac"},
+                {
+                    "id": "trash", "type": 1, "name": "2.iv|name|mac",
+                    "deletedDate": "2026-11-01T00:00:00Z"
+                },
+                {
+                    "id": "archived", "type": 1, "name": "2.iv|name|mac",
+                    "archivedDate": "2026-11-01T00:00:00Z"
+                }
+            ]
+        }
+    });
+    StoragePaths::write_secure_file(
+        paths.vault_cache_file(),
+        &serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+
+    let state =
+        tacet::daemon::DaemonState::new(paths.clone(), std::time::Duration::from_secs(1800));
+    let vault = state.vault.try_read().unwrap();
+    let ciphers = &vault.as_ref().unwrap().ciphers;
+    assert_eq!(ciphers.len(), 2);
+    assert_eq!(ciphers[0].id, "active");
+    assert_eq!(ciphers[1].id, "archived");
+
+    let loaded = EncryptedVaultCache::load(&paths).unwrap();
+    loaded.save(&paths).unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(paths.vault_cache_file()).unwrap()).unwrap();
+    assert_eq!(saved["data"]["ciphers"].as_array().unwrap().len(), 2);
 }

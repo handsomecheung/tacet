@@ -305,6 +305,69 @@ async fn test_upstream_sync() {
 }
 
 #[tokio::test]
+async fn test_sync_excludes_trash_and_keeps_archived_items() {
+    let mock_server = MockServer::start().await;
+    let ciphers: Vec<_> = [None, Some("org-1")]
+        .into_iter()
+        .flat_map(|org_id| {
+            [
+                ("legacy", json!({})),
+                ("active", json!({"deletedDate": null, "archivedDate": null})),
+                ("trash", json!({"deletedDate": "2026-11-01T00:00:00Z"})),
+                ("archived", json!({"archivedDate": "2026-11-01T00:00:00Z"})),
+                (
+                    "both",
+                    json!({
+                        "deletedDate": "2026-11-01T00:00:00Z",
+                        "archivedDate": "2026-10-01T00:00:00Z"
+                    }),
+                ),
+            ]
+            .into_iter()
+            .map(move |(status, dates)| {
+                let mut cipher = json!({
+                    "id": format!("{}-{status}", org_id.unwrap_or("personal")),
+                    "organizationId": org_id,
+                    "type": 1,
+                    "name": "2.iv|same_name|mac"
+                });
+                cipher
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(dates.as_object().unwrap().clone());
+                cipher
+            })
+        })
+        .collect();
+
+    Mock::given(method("GET"))
+        .and(path("/api/sync"))
+        .and(bearer_token("valid_access_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ciphers": ciphers})))
+        .mount(&mock_server)
+        .await;
+
+    let client = UpstreamClient::new(&mock_server.uri()).unwrap();
+    let sync = client.sync("valid_access_token").await.unwrap();
+    let ids: Vec<_> = sync
+        .ciphers
+        .iter()
+        .map(|cipher| cipher.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "personal-legacy",
+            "personal-active",
+            "personal-archived",
+            "org-1-legacy",
+            "org-1-active",
+            "org-1-archived"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_upstream_http_status_error() {
     let mock_server = MockServer::start().await;
 

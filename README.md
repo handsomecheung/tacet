@@ -122,6 +122,10 @@ Organization items appear once per collection membership, with a scope and URI p
 
 `list` and item/attachment lookup use the daemon's local vault cache; they do not automatically sync with the server. Search matches item names, UUIDs, folders, and scopes, not attachment filenames. Run `tacet sync` after changing items or attachments in another client.
 
+Items in the trash are excluded when syncing and loading cached vaults. They do not appear in `list` or item counts and cannot be read or injected, including by UUID. Restore an item in Bitwarden/Vaultwarden and run `tacet sync` to use it again. After upgrading from a version that discarded `deletedDate`, run `tacet sync` once: existing caches without this field cannot distinguish trashed items from non-deleted ones.
+
+Archived items remain available for listing, reading, and injection. Tacet ignores archive state because it is a per-user preference rather than deletion. If a previous Tacet version excluded archived items from the cache, run `tacet sync` to restore them.
+
 ### 4. Read a Secret or Attachment
 Fetch a single secret field or attachment to standard output:
 

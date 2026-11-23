@@ -68,8 +68,18 @@ pub struct SyncResponse {
     pub folders: Vec<FolderResponse>,
     #[serde(default)]
     pub collections: Vec<CollectionResponse>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_deleted_ciphers")]
     pub ciphers: Vec<CipherResponse>,
+}
+
+// Exclude trashed items from both upstream sync responses and cached vaults.
+fn deserialize_non_deleted_ciphers<'de, D>(deserializer: D) -> Result<Vec<CipherResponse>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut ciphers = Vec::<CipherResponse>::deserialize(deserializer)?;
+    ciphers.retain(|cipher| cipher.deleted_date.is_none());
+    Ok(ciphers)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +121,7 @@ pub struct CollectionResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CipherResponse {
     pub id: String,
+    pub deleted_date: Option<String>,
     pub organization_id: Option<String>,
     pub folder_id: Option<String>,
     #[serde(default)]
