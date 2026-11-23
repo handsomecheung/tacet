@@ -513,7 +513,7 @@ async fn test_cli_list() {
     let storage_paths = StoragePaths::custom(tmp.path().join("cfg"), tmp.path().join("cache"));
 
     let user_key = SymmetricKey::new([33u8; 64]);
-    let vault = SyncResponse {
+    let mut vault = SyncResponse {
         profile: Some(ProfileResponse {
             id: "u1".to_string(),
             name: None,
@@ -540,6 +540,26 @@ async fn test_cli_list() {
             fields: None,
         }],
     };
+
+    let folder_id = "unicode-folder";
+    vault.folders.push(tacet::upstream::models::FolderResponse {
+        id: folder_id.into(),
+        name: user_key.encrypt_type2_string(&"日本語".repeat(15)).unwrap(),
+    });
+    for (index, name) in [
+        "サンプルサービス - アカウント管理ページ".to_string(),
+        "日本語".repeat(20),
+        "🔑".repeat(45),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut item = vault.ciphers[0].clone();
+        item.id = format!("33333333-3333-3333-3333-{index:012}");
+        item.name = user_key.encrypt_type2_string(name).unwrap();
+        item.folder_id = Some(folder_id.into());
+        vault.ciphers.push(item);
+    }
 
     let listener = bind_unix_socket(&socket_path).await.unwrap();
     let state = DaemonState::new(storage_paths, Duration::from_secs(1800));

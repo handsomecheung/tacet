@@ -114,6 +114,8 @@ tacet list -q "github"
 tacet list --json
 ```
 
+Table output limits names to 40 Unicode characters and scopes to 30, including a trailing `...` when shortened. Truncation preserves UTF-8 character boundaries. Use `--json` for complete names and scopes.
+
 Listed URI prefixes preserve `/` in nested folder and collection paths. Append a field target such as `/password` to read a secret.
 
 Empty items and items containing only attachments are included. If an item's name is empty or its name or item key cannot be decrypted, the list displays its UUID as the name and URI item target instead of omitting it. Organization items with unavailable organization keys are also retained; collection UUIDs stand in for unavailable collection names. Scope and search filters still apply. Listing an item does not guarantee that its contents can be decrypted.
