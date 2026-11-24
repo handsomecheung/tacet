@@ -7,6 +7,8 @@ pub struct StatusResponse {
     pub logged_in: bool,
     pub unlocked: bool,
     pub server_url: Option<String>,
+    #[serde(default)]
+    pub api_client_id: Option<String>,
     pub item_count: u32,
 }
 
@@ -69,6 +71,23 @@ pub struct LoginResponse {
     pub item_count: u32,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct ReauthenticateRequest {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+impl Drop for ReauthenticateRequest {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.client_secret);
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReauthenticateResponse {
+    pub authenticated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnlockRequest {
     pub master_password: String,
@@ -123,11 +142,22 @@ pub struct ResolveResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<ErrorCode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    ReauthenticationRequired,
 }
 
 impl ErrorResponse {
     pub fn new<S: Into<String>>(msg: S) -> Self {
-        Self { error: msg.into() }
+        Self {
+            error: msg.into(),
+            code: None,
+        }
     }
 }
 

@@ -9,6 +9,9 @@ use std::fs;
 pub struct SessionMetadata {
     pub server_url: String,
     pub email: String,
+    /// Identifies API-key sessions without retaining the client secret; legacy sessions default to None.
+    #[serde(default)]
+    pub api_client_id: Option<String>,
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,

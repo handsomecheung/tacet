@@ -92,6 +92,12 @@ tacet login --apikey --client-id "user.xxxx" --client-secret "yyyy"
 # Or with environment variables: TACET_CLIENT_ID, TACET_CLIENT_SECRET, TACET_PASSWORD
 ```
 
+For API-key sessions, attachment reads and `sync` automatically recover from expired or server-rejected access tokens when the current CLI process has `TACET_CLIENT_ID` and `TACET_CLIENT_SECRET` set. `BW_CLIENTID` and `BW_CLIENTSECRET` are fallback aliases; the `TACET_` variables take precedence. Tacet authenticates against the session's existing server, requires the client ID to match the session, and retries the failed request once without prompting. The daemon's environment can differ from the CLI's environment.
+
+Recovery replaces only the session tokens, preserving cached items and the current lock state. It does not require `TACET_PASSWORD` or persist the API client secret. Field reads, `inject`, and `run` resolve text fields from the local cache without checking or renewing server tokens. An expired server token alone does not interrupt those operations, but a locked vault still requires `tacet unlock`. Password sessions and sessions without matching, non-empty environment credentials do not attempt API-key recovery.
+
+When upgrading to this feature, update both `tacet` and `tacetd` and restart the daemon. Sessions created before this feature require one explicit API-key login to record their login method and enable automatic recovery.
+
 ### 2. Check Daemon Status
 Inspect authentication status, server endpoint, lock state, and cached item counts:
 
@@ -150,7 +156,7 @@ All reads write the resolved value without appending a newline, including encode
 
 Attachments require an unlocked vault and an online server. After upgrading from a version without attachment support, run `tacet sync` to refresh cached attachment metadata. Downloads are verified before any contents are returned. The initial implementation buffers encrypted files in memory, limits each encrypted download to 64 MiB, and supports authenticated Type 2 attachment payloads, including legacy attachments without a dedicated key and modern attachments using item keys. Larger files and other payload formats return an error.
 
-If a newly added item is missing from `list`, or an attachment lookup returns 404, refresh the cache with `tacet sync`. Older cache files may contain items without their attachment metadata. If syncing fails with an upstream 401, repeat your usual `tacet login` command to obtain a valid session; unlocking alone does not renew an expired access token. Then retry syncing and reading the attachment. A successful sync does not resolve a 404 caused by an incorrect reference or an attachment that was deleted upstream.
+If a newly added item is missing from `list`, or an attachment lookup returns 404, refresh the cache with `tacet sync`. Older cache files may contain items without their attachment metadata. API-key sessions can recover expired or rejected access tokens automatically using the environment credentials described above. If recovery is unavailable or fails, repeat your usual `tacet login` command; unlocking alone does not renew an expired access token. Then retry syncing and reading the attachment. A successful sync does not resolve a 404 caused by an incorrect reference or an attachment that was deleted upstream.
 
 ### 5. Template Injection
 Replace `{{ tacet://... }}` placeholders in configuration templates and write the rendered result to a file or stdout:
@@ -302,7 +308,7 @@ tacet run [--env-file <file>] [--no-mask] -- <command> [args...]
 
 ## Storage & Security Model
 
-- **Configuration:** `~/.config/tacet/session.json` (mode `0600`) stores server URL, email, and user public/private key metadata.
+- **Configuration:** `~/.config/tacet/session.json` (mode `0600`) stores server URL, email, session tokens, encrypted key metadata, and the non-secret API client ID for API-key sessions. The API client secret is not persisted.
 - **Device ID:** `~/.config/tacet/device_id` (mode `0600`) stores a persistent UUIDv4 to identify the client installation to Vaultwarden and Bitwarden servers.
 - **Cache:** `~/.cache/tacet/vault.cache` (mode `0600`) caches encrypted CipherStrings directly from Bitwarden.
 - **Socket:** `$XDG_RUNTIME_DIR/tacet/tacetd.sock` (mode `0600`, directory `0700`) enforces local peer UID validation via `SO_PEERCRED`. No TCP sockets are bound, preventing DNS-rebinding and browser-based CSRF attacks.

@@ -9,6 +9,15 @@ use std::collections::HashMap;
 
 pub const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 
+pub fn normalize_api_client_id(client_id: &str) -> String {
+    let client_id = client_id.trim().trim_matches('"').trim_matches('\'');
+    if client_id.starts_with("user.") || client_id.starts_with("organization.") {
+        client_id.to_string()
+    } else {
+        format!("user.{client_id}")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UpstreamClient {
     endpoints: BitwardenEndpoints,
@@ -85,6 +94,10 @@ impl UpstreamClient {
                 .await
                 .map_err(|e| UpstreamError::RequestFailed(e.without_url()))?
                 .url
+        } else if status == StatusCode::UNAUTHORIZED {
+            return Err(UpstreamError::AuthenticationFailed(
+                "Vault server rejected the access token".into(),
+            ));
         } else {
             return Err(UpstreamError::HttpStatusError {
                 status: status.as_u16(),
@@ -232,14 +245,7 @@ impl UpstreamClient {
     ) -> Result<TokenResponse, UpstreamError> {
         let url = self.endpoints.token_url()?;
 
-        let trimmed_client_id = client_id.trim().trim_matches('"').trim_matches('\'');
-        let normalized_client_id = if !trimmed_client_id.starts_with("user.")
-            && !trimmed_client_id.starts_with("organization.")
-        {
-            format!("user.{trimmed_client_id}")
-        } else {
-            trimmed_client_id.to_string()
-        };
+        let normalized_client_id = normalize_api_client_id(client_id);
 
         let trimmed_client_secret = client_secret.trim().trim_matches('"').trim_matches('\'');
 

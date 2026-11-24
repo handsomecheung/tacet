@@ -1,8 +1,10 @@
 use crate::daemon::models::{
-    AttachmentsResponse, ErrorResponse, ListResponse, LockResponse, LoginRequest, LoginResponse,
-    LogoutResponse, ReadRequest, ReadResponse, ResolveRequest, ResolveResponse, StatusResponse,
-    SyncStatusResponse, UnlockRequest, UnlockResponse,
+    AttachmentsResponse, ErrorCode, ErrorResponse, ListResponse, LockResponse, LoginRequest,
+    LoginResponse, LogoutResponse, ReadRequest, ReadResponse, ReauthenticateRequest,
+    ReauthenticateResponse, ResolveRequest, ResolveResponse, StatusResponse, SyncStatusResponse,
+    UnlockRequest, UnlockResponse,
 };
+use crate::upstream::client::normalize_api_client_id;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -27,7 +29,11 @@ pub enum DaemonClientError {
     Json(#[from] serde_json::Error),
 
     #[error("Daemon returned status {status}: {message}")]
-    HttpStatus { status: StatusCode, message: String },
+    HttpStatus {
+        status: StatusCode,
+        message: String,
+        code: Option<ErrorCode>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +72,59 @@ impl DaemonClient {
         path: &str,
         body: Option<&Req>,
     ) -> Result<(hyper::HeaderMap, Vec<u8>), DaemonClientError> {
+        let result = self.send_raw_once(method.clone(), path, body).await;
+        if matches!(
+            &result,
+            Err(DaemonClientError::HttpStatus {
+                code: Some(ErrorCode::ReauthenticationRequired),
+                ..
+            })
+        ) && self.try_api_reauthentication().await?
+        {
+            // Bypass recovery on the retry so repeated authentication failures cannot loop.
+            return self.send_raw_once(method, path, body).await;
+        }
+        result
+    }
+
+    async fn try_api_reauthentication(&self) -> Result<bool, DaemonClientError> {
+        let client_id = std::env::var("TACET_CLIENT_ID")
+            .or_else(|_| std::env::var("BW_CLIENTID"))
+            .ok()
+            .filter(|value| !value.trim().trim_matches('"').trim_matches('\'').is_empty());
+        let client_secret = std::env::var("TACET_CLIENT_SECRET")
+            .or_else(|_| std::env::var("BW_CLIENTSECRET"))
+            .ok()
+            .filter(|value| !value.trim().trim_matches('"').trim_matches('\'').is_empty());
+        let (Some(client_id), Some(client_secret)) = (client_id, client_secret) else {
+            return Ok(false);
+        };
+        let request = ReauthenticateRequest {
+            client_id,
+            client_secret,
+        };
+        let (_, bytes) = self
+            .send_raw_once::<()>(Method::GET, "/v1/status", None)
+            .await?;
+        let status: StatusResponse = serde_json::from_slice(&bytes)?;
+        if status.api_client_id.as_deref()
+            != Some(normalize_api_client_id(&request.client_id).as_str())
+        {
+            return Ok(false);
+        }
+        let (_, bytes) = self
+            .send_raw_once(Method::POST, "/v1/reauthenticate", Some(&request))
+            .await?;
+        let response: ReauthenticateResponse = serde_json::from_slice(&bytes)?;
+        Ok(response.authenticated)
+    }
+
+    async fn send_raw_once<Req: serde::Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Req>,
+    ) -> Result<(hyper::HeaderMap, Vec<u8>), DaemonClientError> {
         let stream = UnixStream::connect(&self.socket_path).await?;
         let io = TokioIo::new(stream);
         let (mut sender, conn) = http1::handshake(io).await?;
@@ -97,14 +156,18 @@ impl DaemonClient {
         if status.is_success() {
             Ok((headers, resp_bytes.to_vec()))
         } else {
-            let message = if let Ok(err_resp) = serde_json::from_slice::<ErrorResponse>(&resp_bytes)
-            {
-                err_resp.error
-            } else {
-                String::from_utf8_lossy(&resp_bytes).to_string()
-            };
+            let (message, code) =
+                if let Ok(err_resp) = serde_json::from_slice::<ErrorResponse>(&resp_bytes) {
+                    (err_resp.error, err_resp.code)
+                } else {
+                    (String::from_utf8_lossy(&resp_bytes).to_string(), None)
+                };
 
-            Err(DaemonClientError::HttpStatus { status, message })
+            Err(DaemonClientError::HttpStatus {
+                status,
+                message,
+                code,
+            })
         }
     }
 

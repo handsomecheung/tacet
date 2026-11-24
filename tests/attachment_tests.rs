@@ -336,6 +336,7 @@ impl Harness {
         *state.session.write().await = Some(SessionMetadata {
             server_url: upstream.uri(),
             email: "u@example.com".into(),
+            api_client_id: None,
             access_token: "vault-token".into(),
             refresh_token: None,
             expires_at: None,
@@ -804,4 +805,411 @@ async fn list_retains_empty_unnamed_and_undecryptable_items() {
             assert!(table.contains("Total: 2 entries (1 unique item)"));
         }
     }
+}
+
+impl Harness {
+    async fn expire_api_session(&self) {
+        let mut guard = self.state.session.write().await;
+        let session = guard.as_mut().unwrap();
+        session.api_client_id = Some("user.api-user".into());
+        session.access_token = "old-token".into();
+        session.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        session.save(&self.state.storage_paths).unwrap();
+    }
+
+    async fn mount_api_reauthentication(&self, status: u16) {
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=client_credentials",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "client_id=user.api-user",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "client_secret=ci-api-secret",
+            ))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "access_token": "vault-token", "expires_in": 7200, "token_type": "Bearer"
+                })),
+            )
+            .expect(1)
+            .mount(&self.upstream)
+            .await;
+    }
+
+    async fn cli_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tacet"));
+        command.arg("--socket").arg(&self.socket).args(args);
+        for name in [
+            "TACET_CLIENT_ID",
+            "TACET_CLIENT_SECRET",
+            "TACET_PASSWORD",
+            "BW_CLIENTID",
+            "BW_CLIENTSECRET",
+            "BW_PASSWORD",
+            "TACET_SERVER",
+            "TACET_EMAIL",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .envs(env.iter().copied())
+            .stdin(std::process::Stdio::null());
+        tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+const CI_API_ENV: &[(&str, &str)] = &[
+    ("TACET_CLIENT_ID", "api-user"),
+    ("TACET_CLIENT_SECRET", "ci-api-secret"),
+];
+
+#[tokio::test]
+async fn cli_api_reauthentication_uses_current_env_and_preserves_unlocked_vault() {
+    for env in [
+        vec![
+            ("TACET_CLIENT_ID", " 'api-user' "),
+            ("TACET_CLIENT_SECRET", "ci-api-secret"),
+            ("BW_CLIENTID", "wrong-user"),
+            ("BW_CLIENTSECRET", "wrong-secret"),
+            ("TACET_SERVER", "http://unused.invalid"),
+        ],
+        vec![
+            ("BW_CLIENTID", "user.api-user"),
+            ("BW_CLIENTSECRET", "ci-api-secret"),
+        ],
+    ] {
+        let h = Harness::new().await;
+        h.expire_api_session().await;
+        h.mount_api_reauthentication(200).await;
+        h.mount(h.encrypted.clone(), Duration::ZERO).await;
+
+        let output = h
+            .cli_with_env(&["read", "tacet://*/Server/example.exe"], &env)
+            .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, ORIGINAL);
+        assert!(output.stderr.is_empty());
+        assert!(h.state.is_unlocked().await);
+        let session = SessionMetadata::load(&h.state.storage_paths).unwrap();
+        assert_eq!(session.access_token, "vault-token");
+        assert_eq!(session.api_client_id.as_deref(), Some("user.api-user"));
+        assert!(session.expires_at.unwrap() > chrono::Utc::now());
+        let saved = std::fs::read_to_string(h.state.storage_paths.session_file()).unwrap();
+        assert!(!saved.contains("ci-api-secret") && !saved.contains("client_secret"));
+        let requests = h.upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|r| r.url.path() != "/api/sync"));
+    }
+}
+
+#[tokio::test]
+async fn cli_sync_reauthenticates_for_expiry_and_upstream_401() {
+    for expired in [true, false] {
+        let h = Harness::new().await;
+        h.expire_api_session().await;
+        if !expired {
+            h.state.session.write().await.as_mut().unwrap().expires_at = None;
+        }
+        h.mount_api_reauthentication(200).await;
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .and(bearer_token("old-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(if expired { 0 } else { 1 })
+            .mount(&h.upstream)
+            .await;
+        let vault = h.state.vault.read().await.clone().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/api/sync"))
+            .and(bearer_token("vault-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&vault))
+            .expect(1)
+            .mount(&h.upstream)
+            .await;
+
+        let output = h.cli_with_env(&["sync"], CI_API_ENV).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "✓ Vault synchronized successfully (1 items).\n"
+        );
+        assert!(output.stderr.is_empty());
+        assert!(h.state.is_unlocked().await);
+        let saved = SessionMetadata::load(&h.state.storage_paths).unwrap();
+        assert_eq!(saved.access_token, "vault-token");
+        assert!(saved.last_synced.is_some());
+    }
+}
+
+#[tokio::test]
+async fn cli_attachment_reauthenticates_when_server_rejects_unexpired_token() {
+    let h = Harness::new().await;
+    h.expire_api_session().await;
+    h.state.session.write().await.as_mut().unwrap().expires_at = None;
+    h.mount_api_reauthentication(200).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/ciphers/{ITEM_ID}/attachment/attachment-0"
+        )))
+        .and(bearer_token("old-token"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    h.mount(h.encrypted.clone(), Duration::ZERO).await;
+
+    let output = h
+        .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+        .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, ORIGINAL);
+    assert!(output.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn cli_does_not_reauthenticate_without_matching_api_session_and_credentials() {
+    for env in [
+        vec![],
+        vec![("TACET_CLIENT_ID", "api-user")],
+        vec![("TACET_CLIENT_SECRET", "ci-api-secret")],
+        vec![
+            ("TACET_CLIENT_ID", "api-user"),
+            ("TACET_CLIENT_SECRET", "  "),
+        ],
+        vec![
+            ("TACET_CLIENT_ID", "other-user"),
+            ("TACET_CLIENT_SECRET", "ci-api-secret"),
+        ],
+        CI_API_ENV.to_vec(),
+    ] {
+        let h = Harness::new().await;
+        h.expire_api_session().await;
+        if env == CI_API_ENV {
+            h.state
+                .session
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .api_client_id = None;
+        }
+        let output = h
+            .cli_with_env(&["read", "tacet://*/Server/example.exe"], &env)
+            .await;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Session expired"));
+        assert!(h.upstream.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn cli_cached_fields_lookup_errors_and_locked_vault_do_not_reauthenticate() {
+    let h = Harness::new().await;
+    h.expire_api_session().await;
+    let output = h
+        .cli_with_env(&["read", "tacet://*/Server/password"], CI_API_ENV)
+        .await;
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"field-password");
+    let output = h
+        .cli_with_env(&["read", "tacet://*/Server/files/missing"], CI_API_ENV)
+        .await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("404 Not Found"));
+    h.state.lock().await;
+    let output = h
+        .cli_with_env(&["read", "tacet://*/Server/password"], CI_API_ENV)
+        .await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tacet unlock"));
+    assert!(h.upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cli_reauthentication_failures_are_bounded_and_do_not_leak_credentials() {
+    for token_status in [200, 401, 503] {
+        let h = Harness::new().await;
+        h.expire_api_session().await;
+        h.mount_api_reauthentication(token_status).await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/ciphers/{ITEM_ID}/attachment/attachment-0"
+            )))
+            .and(bearer_token("vault-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(if token_status == 200 { 1 } else { 0 })
+            .mount(&h.upstream)
+            .await;
+        let output = h
+            .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+            .await;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(!error.contains("ci-api-secret"));
+        assert!(
+            error.contains(if token_status == 503 {
+                "502 Bad Gateway"
+            } else {
+                "401 Unauthorized"
+            }),
+            "{error}"
+        );
+        assert!(h.state.is_unlocked().await);
+        if token_status != 200 {
+            let saved = SessionMetadata::load(&h.state.storage_paths).unwrap();
+            assert_eq!(saved.access_token, "old-token");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cli_blob_401_does_not_reauthenticate_vault_session() {
+    let h = Harness::new().await;
+    h.expire_api_session().await;
+    h.state.session.write().await.as_mut().unwrap().expires_at = None;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/ciphers/{ITEM_ID}/attachment/attachment-0"
+        )))
+        .and(bearer_token("old-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url": format!("{}/blob", h.upstream.uri())
+        })))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blob"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    let output = h
+        .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+        .await;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("502 Bad Gateway"));
+    assert_eq!(h.upstream.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cli_api_reauthentication_distinguishes_invalid_refresh_from_server_outage() {
+    for refresh_status in [400, 503] {
+        let h = Harness::new().await;
+        h.expire_api_session().await;
+        h.state
+            .session
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .refresh_token = Some("old-refresh".into());
+        Mock::given(method("POST"))
+            .and(path("/identity/connect/token"))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=refresh_token",
+            ))
+            .respond_with(ResponseTemplate::new(refresh_status))
+            .expect(1)
+            .mount(&h.upstream)
+            .await;
+        if refresh_status == 400 {
+            h.mount_api_reauthentication(200).await;
+            h.mount(h.encrypted.clone(), Duration::ZERO).await;
+        }
+        let output = h
+            .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+            .await;
+        if refresh_status == 400 {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, ORIGINAL);
+        } else {
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("502 Bad Gateway"));
+            assert_eq!(h.upstream.received_requests().await.unwrap().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reauthentication_endpoint_rejects_password_sessions_and_account_switches() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for api_client_id in [None, Some("user.other-user".to_string())] {
+        let h = Harness::new().await;
+        h.expire_api_session().await;
+        h.state
+            .session
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .api_client_id = api_client_id;
+        let body = serde_json::json!({
+            "client_id": "user.api-user", "client_secret": "ci-api-secret"
+        })
+        .to_string();
+        let request = format!("POST /v1/reauthenticate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let mut stream = tokio::net::UnixStream::connect(&h.socket).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(h.upstream.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            h.state.session.read().await.as_ref().unwrap().access_token,
+            "old-token"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cli_api_reauthentication_does_not_unlock_a_locked_vault() {
+    let h = Harness::new().await;
+    h.expire_api_session().await;
+    h.state.lock().await;
+    h.mount_api_reauthentication(200).await;
+    let vault = h.state.vault.read().await.clone().unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/sync"))
+        .and(bearer_token("vault-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&vault))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    let output = h.cli_with_env(&["sync"], CI_API_ENV).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!h.state.is_unlocked().await);
 }

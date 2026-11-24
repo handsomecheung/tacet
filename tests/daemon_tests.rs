@@ -190,6 +190,7 @@ async fn test_daemon_full_rest_lifecycle() {
     let status_logged_in = client.status().await.unwrap();
     assert!(status_logged_in.logged_in);
     assert!(status_logged_in.unlocked);
+    assert!(status_logged_in.api_client_id.is_none());
     assert_eq!(status_logged_in.item_count, 2);
 
     // D. Resolve secret while unlocked
@@ -459,6 +460,22 @@ async fn test_daemon_api_key_login_and_unlock() {
     assert!(status.logged_in);
     assert!(!status.unlocked);
     assert_eq!(status.item_count, 1);
+    assert_eq!(
+        status.api_client_id.as_deref(),
+        Some("user.22222222-3333-4444-5555-666666666666")
+    );
+    let restored = DaemonState::new(storage_paths, Duration::from_secs(1800));
+    assert_eq!(
+        restored
+            .session
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .api_client_id,
+        status.api_client_id
+    );
+    assert!(!restored.is_unlocked().await);
 
     // Resolving secrets should fail while locked
     let resolve_res = client

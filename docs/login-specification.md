@@ -127,9 +127,33 @@ Tacet bridges this gap by offering two ergonomic execution modes:
 3. **KDF Parameter Resolution**:
    Using `profile.email` (or a user-specified email override), `tacetd` queries `POST /identity/accounts/prelogin` to fetch the account's KDF algorithm and iteration count.
 4. **Session Persistence**:
-   Session metadata (`server_url`, `email`, `access_token`, `refresh_token`, `kdf_params`, `protected_symmetric_key`) is written to `~/.config/tacet/session.json` with strict Unix permissions (`0600`).
+   Session metadata (`server_url`, `email`, normalized `api_client_id`, `access_token`, optional `refresh_token`, `expires_at`, `kdf_params`, and encrypted key metadata) is written to `~/.config/tacet/session.json` with strict Unix permissions (`0600`). The API client ID identifies the session's authentication method and account; the API client secret is not persisted. Password sessions have `api_client_id: null`.
 5. **Decryption (If Password Provided)**:
    If `master_password` is provided, `tacetd` computes the master key and decrypts the symmetric key into memory, returning `unlocked: true`. If omitted, `tacetd` returns `unlocked: false`.
+
+### Access Token Renewal and API-Key Recovery
+
+Attachment reads and `tacet sync` require upstream authentication. Before either operation, the daemon checks whether the access token has expired or has 60 seconds or less remaining. It uses a refresh token when one is available. API-key sessions can have no refresh token; in that case, obtaining a new access token requires another `client_credentials` exchange.
+
+When upstream authentication requires a new login, the daemon returns HTTP 401 with the structured error code `reauthentication_required`. The CLI handles that response as follows:
+
+1. Read `TACET_CLIENT_ID` and `TACET_CLIENT_SECRET` from the current CLI process environment, falling back to `BW_CLIENTID` and `BW_CLIENTSECRET` respectively. The `TACET_` variables take precedence; missing or empty credentials leave the original error unchanged.
+2. Read the daemon's current session status. Recovery is eligible only when the session has an `api_client_id` matching the normalized environment client ID. Password sessions and mismatched credentials do not trigger API-key authentication.
+3. Send the credentials to `POST /v1/reauthenticate`. The daemon validates the client ID again and authenticates against the session's existing server; `TACET_SERVER` does not override that server during recovery.
+4. Replace and persist the session tokens and expiry, preserving cached vault contents, decrypted keys, and the current lock state. No master password, prelogin request, or vault sync is needed for this token-only renewal.
+5. Retry the original operation once. A failed reauthentication or a second authentication failure ends the command without further retries or interactive prompts. Recovery does not write login messages to stdout, preserving attachment output.
+
+Server-rejected access tokens can trigger recovery even before their recorded expiry. HTTP 400 or 401 from a refresh attempt also requires reauthentication. Transient upstream errors and authentication failures from the separate attachment blob download do not trigger API-key recovery.
+
+| Operation | Server token required | Behavior when the vault is locked |
+|---|---|---|
+| Attachment `read` | Yes; eligible for automatic recovery | Requires `tacet unlock` before downloading |
+| `sync` | Yes; eligible for automatic recovery | Can sync; recovery leaves the vault locked |
+| Field `read`, `inject`, `run` | No; values resolve from the local cache without token renewal | Requires `tacet unlock` |
+
+The environment of an already running daemon can differ from that of the current CLI process. Credentials must be available to each CLI invocation that may need recovery; values supplied only to an earlier login command or only inside `run --env-file` are not process environment credentials for recovery.
+
+When upgrading, update both `tacet` and `tacetd` and restart the daemon. Older session files load with `api_client_id: null`; perform one explicit API-key login after upgrading to record the authentication method and enable recovery. The absence of a refresh token alone is not treated as proof of an API-key session.
 
 ---
 
@@ -184,6 +208,8 @@ Establishes a session using either Password or API Key authentication.
 ### `POST /v1/unlock`
 Restores key custody from a previously authenticated session without requiring re-login.
 
+Unlock derives keys using cached session metadata and the supplied master password. It does not validate or renew upstream tokens and can succeed with an expired server token.
+
 #### Request Schema (`application/json`):
 ```json
 {
@@ -197,6 +223,66 @@ Restores key custody from a previously authenticated session without requiring r
   "unlocked": true
 }
 ```
+
+### `GET /v1/status`
+
+Returns daemon state, including the normalized API client ID for API-key sessions:
+
+```json
+{
+  "running": true,
+  "logged_in": true,
+  "unlocked": true,
+  "server_url": "https://vault.example.com",
+  "api_client_id": "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "item_count": 42
+}
+```
+
+`api_client_id` is null for password sessions, legacy sessions, and logged-out state. `logged_in` indicates that a local session exists; it does not guarantee that its upstream access token remains valid.
+
+### `POST /v1/reauthenticate`
+
+Renews tokens for an existing API-key session without replacing the vault or changing its lock state. This endpoint is used by automatic CLI recovery; it is not a separate CLI command.
+
+#### Request Schema (`application/json`):
+
+```json
+{
+  "client_id": "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "client_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+}
+```
+
+The normalized client ID must match the existing session. The server URL comes exclusively from that session. The client secret is used for the upstream token exchange, zeroized when the request is dropped, and never persisted.
+
+#### Response (`200 OK`):
+
+```json
+{
+  "authenticated": true
+}
+```
+
+#### Error Responses:
+
+- `400 Bad Request`: The current session is not an API-key session or its client ID does not match.
+- `401 Unauthorized`: No current session, or the upstream server rejected the supplied credentials.
+- `500 Internal Server Error`: Device metadata or session persistence failed.
+- `502 Bad Gateway`: The upstream server could not complete the token exchange.
+
+### Reauthentication Error Contract
+
+Attachment reads and sync return the following response when a new upstream login is required:
+
+```json
+{
+  "error": "Session expired. Run 'tacet login' again.",
+  "code": "reauthentication_required"
+}
+```
+
+The HTTP status is 401; the human-readable message can differ for rejected tokens or failed refresh attempts. Recovery relies on `code`, not message matching or HTTP 401 alone. Locked-vault errors do not carry this code. Blob-download failures and transient upstream failures return errors without triggering automatic reauthentication.
 
 ---
 
@@ -241,6 +327,9 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      TACET_CLIENT_ID: ${{ secrets.BW_CLIENTID }}
+      TACET_CLIENT_SECRET: ${{ secrets.BW_CLIENTSECRET }}
     steps:
       - uses: actions/checkout@v4
 
@@ -252,16 +341,17 @@ jobs:
       - name: Authenticate Tacet via API Key
         env:
           TACET_SERVER: ${{ secrets.VAULT_URL }}
-          TACET_CLIENT_ID: ${{ secrets.BW_CLIENTID }}
-          TACET_CLIENT_SECRET: ${{ secrets.BW_CLIENTSECRET }}
           TACET_PASSWORD: ${{ secrets.BW_PASSWORD }}
         run: |
           tacet login --apikey
 
       - name: Run Build with Injected Secrets
         run: |
+          tacet sync
           tacet run -- npm run build && tacet run -- ./deploy.sh
 ```
+
+The job-level API credentials are available to later CLI invocations, so `sync` and attachment reads can recover expired tokens without prompting. `TACET_PASSWORD` is needed for the initial unlock and is scoped to the login step here. Token recovery preserves the lock state; if the daemon subsequently auto-locks, provide the master password to `tacet unlock` before reading or injecting secrets.
 
 ### Example 2: Developer Local Terminal (Interactive)
 ```bash

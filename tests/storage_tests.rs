@@ -29,6 +29,7 @@ fn test_session_lifecycle_and_permissions() {
     let session = SessionMetadata {
         server_url: "https://vault.example.com".to_string(),
         email: "alice@example.com".to_string(),
+        api_client_id: None,
         access_token: "jwt_token_123".to_string(),
         refresh_token: Some("refresh_abc".to_string()),
         expires_at: Some(Utc::now()),
@@ -63,6 +64,16 @@ fn test_session_lifecycle_and_permissions() {
         loaded.protected_symmetric_key,
         session.protected_symmetric_key
     );
+
+    let mut api_session = session.clone();
+    api_session.api_client_id = Some("user.api-user".into());
+    api_session.save(&paths).unwrap();
+    let loaded = SessionMetadata::load(&paths).unwrap();
+    assert_eq!(loaded.api_client_id, api_session.api_client_id);
+    let mut legacy = serde_json::to_value(&api_session).unwrap();
+    legacy.as_object_mut().unwrap().remove("api_client_id");
+    let legacy: SessionMetadata = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.api_client_id.is_none());
 
     // Clear session
     SessionMetadata::clear(&paths).expect("Clear failed");

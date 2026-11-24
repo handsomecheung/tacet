@@ -4,15 +4,17 @@ use crate::crypto::kdf::{
 };
 use crate::crypto::symmetric_key::SymmetricKey;
 use crate::daemon::models::{
-    AttachmentsResponse, ErrorResponse, ListQuery, ListResponse, LockResponse, LoginRequest,
-    LoginResponse, LogoutResponse, ReadRequest, ResolveRequest, ResolveResponse, StatusResponse,
-    SyncStatusResponse, UnlockRequest, UnlockResponse,
+    AttachmentsResponse, ErrorCode, ErrorResponse, ListQuery, ListResponse, LockResponse,
+    LoginRequest, LoginResponse, LogoutResponse, ReadRequest, ReauthenticateRequest,
+    ReauthenticateResponse, ResolveRequest, ResolveResponse, StatusResponse, SyncStatusResponse,
+    UnlockRequest, UnlockResponse,
 };
 use crate::daemon::state::DaemonState;
 use crate::error::{ResolverError, UpstreamError};
 use crate::resolver::{ReadTarget, VaultResolver};
 use crate::storage::session::SessionMetadata;
 use crate::storage::vault_cache::EncryptedVaultCache;
+use crate::upstream::client::normalize_api_client_id;
 use crate::upstream::models::TwoFactorCredentials;
 use crate::upstream::UpstreamClient;
 use crate::uri::parser::TacetUri;
@@ -28,6 +30,7 @@ pub fn create_router(state: DaemonState) -> Router {
     Router::new()
         .route("/v1/status", get(status_handler))
         .route("/v1/login", post(login_handler))
+        .route("/v1/reauthenticate", post(reauthenticate_handler))
         .route("/v1/unlock", post(unlock_handler))
         .route("/v1/lock", post(lock_handler))
         .route("/v1/logout", post(logout_handler))
@@ -46,12 +49,19 @@ async fn status_handler(State(state): State<DaemonState>) -> impl IntoResponse {
     let unlocked = state.is_unlocked().await;
     let server_url = state.server_url().await;
     let item_count = state.item_count().await;
+    let api_client_id = state
+        .session
+        .read()
+        .await
+        .as_ref()
+        .and_then(|s| s.api_client_id.clone());
 
     Json(StatusResponse {
         running: true,
         logged_in,
         unlocked,
         server_url,
+        api_client_id,
         item_count,
     })
 }
@@ -196,6 +206,7 @@ async fn login_handler(
         let session_meta = SessionMetadata {
             server_url: req.server_url.clone(),
             email: email.clone(),
+            api_client_id: Some(normalize_api_client_id(client_id)),
             access_token: token_resp.access_token.clone(),
             refresh_token: token_resp.refresh_token.clone(),
             expires_at: Some(expires_at),
@@ -352,6 +363,7 @@ async fn login_handler(
     let session_meta = SessionMetadata {
         server_url: req.server_url.clone(),
         email: email.to_string(),
+        api_client_id: None,
         access_token: token_resp.access_token.clone(),
         refresh_token: token_resp.refresh_token.clone(),
         expires_at: Some(expires_at),
@@ -394,6 +406,55 @@ async fn login_handler(
     Ok(Json(LoginResponse {
         unlocked: true,
         item_count,
+    }))
+}
+
+async fn reauthenticate_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<ReauthenticateRequest>,
+) -> Result<Json<ReauthenticateResponse>, ApiError> {
+    state.touch_activity();
+    let mut guard = state.session.write().await;
+    let session = guard
+        .as_ref()
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Not logged in"))?;
+    if session.api_client_id.as_deref() != Some(normalize_api_client_id(&req.client_id).as_str()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "API credentials do not match the current API-key session",
+        ));
+    }
+    let client = UpstreamClient::new(&session.server_url)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let device_id = state
+        .storage_paths
+        .get_or_create_device_id()
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let response = client
+        .login_api_key(&req.client_id, &req.client_secret, Some(&device_id))
+        .await
+        .map_err(|e| match e {
+            UpstreamError::HttpStatusError {
+                status: 400 | 401, ..
+            } => api_error(
+                StatusCode::UNAUTHORIZED,
+                "API-key reauthentication failed: credentials were rejected",
+            ),
+            _ => api_error(
+                StatusCode::BAD_GATEWAY,
+                "API-key reauthentication failed: vault server unavailable",
+            ),
+        })?;
+    let mut renewed = session.clone();
+    renewed.access_token = response.access_token;
+    renewed.refresh_token = response.refresh_token;
+    renewed.expires_at = Some(Utc::now() + Duration::seconds(response.expires_in as i64));
+    renewed
+        .save(&state.storage_paths)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    *guard = Some(renewed);
+    Ok(Json(ReauthenticateResponse {
+        authenticated: true,
     }))
 }
 
@@ -502,74 +563,38 @@ async fn sync_handler(
 ) -> Result<Json<SyncStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     state.touch_activity();
 
-    // 1. Get session
-    let mut session = {
-        let guard = state.session.read().await;
-        if let Some(s) = guard.as_ref() {
-            s.clone()
+    let (client, snapshot) = upstream_session(&state).await?;
+    let sync_resp = client.sync(&snapshot.access_token).await.map_err(|e| {
+        if matches!(e, UpstreamError::HttpStatusError { status: 401, .. }) {
+            reauthentication_required("Session rejected by server. Run 'tacet login' again.")
         } else {
-            SessionMetadata::load(&state.storage_paths).map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse::new("Not logged in")),
-                )
-            })?
+            api_error(StatusCode::BAD_GATEWAY, format!("Sync failed: {e}"))
         }
-    };
-
-    let client = {
-        let mut client_guard = state.upstream_client.write().await;
-        if client_guard.is_none() {
-            let c = UpstreamClient::new(&session.server_url).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(e.to_string())),
-                )
-            })?;
-            *client_guard = Some(c.clone());
-            c
-        } else {
-            client_guard.as_ref().unwrap().clone()
-        }
-    };
-
-    // 2. Check if token needs refresh
-    let now = Utc::now();
-    let is_expired = session
-        .expires_at
-        .map(|exp| exp <= now + Duration::seconds(60))
-        .unwrap_or(false);
-
-    if is_expired && session.refresh_token.is_some() {
-        let refresh_tok = session.refresh_token.as_ref().unwrap();
-        if let Ok(token_resp) = client.refresh_token(refresh_tok).await {
-            session.access_token = token_resp.access_token;
-            if let Some(rt) = token_resp.refresh_token {
-                session.refresh_token = Some(rt);
-            }
-            session.expires_at = Some(now + Duration::seconds(token_resp.expires_in as i64));
-            let _ = session.save(&state.storage_paths);
-        }
-    }
-
-    // 3. Fetch sync
-    let sync_resp = client.sync(&session.access_token).await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(format!("Sync failed: {e}"))),
-        )
     })?;
-
     let item_count = sync_resp.ciphers.len() as u32;
 
-    // 4. Persist cache and update memory
+    let mut guard = state.session.write().await;
+    let session = guard
+        .as_mut()
+        .ok_or_else(|| api_error(StatusCode::CONFLICT, "Session changed during sync"))?;
+    if session.server_url != snapshot.server_url
+        || session.user_id != snapshot.user_id
+        || session.api_client_id != snapshot.api_client_id
+        || session.email != snapshot.email
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Session changed during sync",
+        ));
+    }
     let cache = EncryptedVaultCache::new(sync_resp.clone());
-    let _ = cache.save(&state.storage_paths);
-
+    cache
+        .save(&state.storage_paths)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     session.last_synced = Some(Utc::now());
-    let _ = session.save(&state.storage_paths);
-
-    *state.session.write().await = Some(session);
+    session
+        .save(&state.storage_paths)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     *state.vault.write().await = Some(sync_resp);
 
     Ok(Json(SyncStatusResponse {
@@ -627,6 +652,16 @@ type ApiError = (StatusCode, Json<ErrorResponse>);
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     (status, Json(ErrorResponse::new(message)))
+}
+
+fn reauthentication_required(message: &str) -> ApiError {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: message.into(),
+            code: Some(ErrorCode::ReauthenticationRequired),
+        }),
+    )
 }
 
 fn resolver_response(error: ResolverError) -> ApiError {
@@ -699,16 +734,21 @@ async fn read_handler(
         }
     };
     // Release key guards before network IO so locking remains immediate during downloads.
-    let (client, token) = attachment_session(&state).await?;
+    let (client, session) = upstream_session(&state).await?;
     let encrypted = client
         .download_attachment(
-            &token,
+            &session.access_token,
             &selected.cipher_id,
             &selected.attachment.id,
             selected.attachment.url.as_deref(),
         )
         .await
         .map_err(|e| {
+            if matches!(e, UpstreamError::AuthenticationFailed(_)) {
+                return reauthentication_required(
+                    "Session rejected by server. Run 'tacet login' again.",
+                );
+            }
             let status = match &e {
                 UpstreamError::AttachmentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
                 UpstreamError::HttpStatusError { status: 404, .. } => StatusCode::NOT_FOUND,
@@ -736,7 +776,9 @@ async fn read_handler(
     Ok(read_response(bytes, true, uri.modifiers.encoding.is_some()))
 }
 
-async fn attachment_session(state: &DaemonState) -> Result<(UpstreamClient, String), ApiError> {
+async fn upstream_session(
+    state: &DaemonState,
+) -> Result<(UpstreamClient, SessionMetadata), ApiError> {
     let client = state
         .upstream_client
         .read()
@@ -752,16 +794,23 @@ async fn attachment_session(state: &DaemonState) -> Result<(UpstreamClient, Stri
         .is_some_and(|expiry| expiry <= Utc::now() + Duration::seconds(60))
     {
         let refresh = session.refresh_token.as_ref().ok_or_else(|| {
-            api_error(
-                StatusCode::UNAUTHORIZED,
-                "Session expired. Run 'tacet login' again.",
-            )
+            reauthentication_required("Session expired. Run 'tacet login' again.")
         })?;
-        let response = client.refresh_token(refresh).await.map_err(|_| {
-            api_error(
-                StatusCode::UNAUTHORIZED,
-                "Session refresh failed. Run 'tacet login' again.",
-            )
+        let response = client.refresh_token(refresh).await.map_err(|e| {
+            if matches!(
+                e,
+                UpstreamError::HttpStatusError {
+                    status: 400 | 401,
+                    ..
+                }
+            ) {
+                reauthentication_required("Session refresh failed. Run 'tacet login' again.")
+            } else {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Session refresh failed: {e}"),
+                )
+            }
         })?;
         session.access_token = response.access_token;
         if let Some(refresh) = response.refresh_token {
@@ -772,7 +821,7 @@ async fn attachment_session(state: &DaemonState) -> Result<(UpstreamClient, Stri
             .save(&state.storage_paths)
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
-    Ok((client, session.access_token.clone()))
+    Ok((client, session.clone()))
 }
 
 async fn attachments_handler(
