@@ -97,6 +97,15 @@ pub async fn execute_run(
         }
     }
 
+    for (name, value) in &injected_env {
+        if value.contains('\0') {
+            return Err(format!(
+                "Environment variable '{name}' contains a NUL byte; use encoding=base64 or encoding=hex for binary attachments"
+            )
+            .into());
+        }
+    }
+
     // 6. Build subprocess
     let mut cmd = Command::new(&command[0]);
     if command.len() > 1 {

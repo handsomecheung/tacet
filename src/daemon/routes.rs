@@ -11,6 +11,7 @@ use crate::daemon::models::{
 };
 use crate::daemon::state::DaemonState;
 use crate::error::{ResolverError, UpstreamError};
+use crate::resolver::vault_resolver::ResolvedAttachment;
 use crate::resolver::{ReadTarget, VaultResolver};
 use crate::storage::session::SessionMetadata;
 use crate::storage::vault_cache::EncryptedVaultCache;
@@ -632,7 +633,7 @@ async fn resolve_handler(
     let rsa_guard = state.rsa_private_key.read().await;
     let resolver = VaultResolver::new(vault, sym_key, rsa_guard.as_ref());
 
-    let mut secrets = HashMap::new();
+    let mut selected = Vec::new();
     for uri_str in &req.uris {
         let parsed_uri = TacetUri::parse(uri_str).map_err(|e| {
             (
@@ -641,8 +642,36 @@ async fn resolve_handler(
             )
         })?;
 
-        let value = resolver.resolve(&parsed_uri).map_err(resolver_response)?;
-        secrets.insert(uri_str.clone(), value);
+        let target = resolver
+            .select_read(&parsed_uri)
+            .map_err(resolver_response)?;
+        selected.push((uri_str.clone(), parsed_uri, target));
+    }
+
+    // Drop the resolver's keys and guards before any attachment network requests.
+    drop(resolver);
+    drop(rsa_guard);
+    drop(vault_guard);
+    drop(sym_key_guard);
+
+    let mut secrets = HashMap::new();
+    for (uri_str, uri, target) in selected {
+        let value = match target {
+            ReadTarget::Text(value) => value,
+            ReadTarget::Attachment(attachment) => {
+                let bytes = download_attachment(&state, &attachment, &uri).await?;
+                String::from_utf8(bytes).map_err(|error| {
+                    api_error(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Attachment for '{uri_str}' is not valid UTF-8: {}; use encoding=base64 or encoding=hex for binary data",
+                            error.utf8_error()
+                        ),
+                    )
+                })?
+            }
+        };
+        secrets.insert(uri_str, value);
     }
 
     Ok(Json(ResolveResponse { secrets }))
@@ -733,8 +762,17 @@ async fn read_handler(
             ReadTarget::Attachment(selected) => selected,
         }
     };
-    // Release key guards before network IO so locking remains immediate during downloads.
-    let (client, session) = upstream_session(&state).await?;
+    let bytes = download_attachment(&state, &selected, &uri).await?;
+    Ok(read_response(bytes, true, uri.modifiers.encoding.is_some()))
+}
+
+/// Downloads without holding key guards, then decrypts using the current unlocked vault.
+async fn download_attachment(
+    state: &DaemonState,
+    selected: &ResolvedAttachment,
+    uri: &TacetUri,
+) -> Result<Vec<u8>, ApiError> {
+    let (client, session) = upstream_session(state).await?;
     let encrypted = client
         .download_attachment(
             &session.access_token,
@@ -770,10 +808,10 @@ async fn read_handler(
     let rsa_guard = state.rsa_private_key.read().await;
     let resolver = VaultResolver::new(vault, key, rsa_guard.as_ref());
     let bytes = resolver
-        .decrypt_attachment(&selected, &encrypted, &uri)
+        .decrypt_attachment(selected, &encrypted, uri)
         .map_err(resolver_response)?;
     state.touch_activity();
-    Ok(read_response(bytes, true, uri.modifiers.encoding.is_some()))
+    Ok(bytes)
 }
 
 async fn upstream_session(

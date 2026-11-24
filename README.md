@@ -94,7 +94,7 @@ tacet login --apikey --client-id "user.xxxx" --client-secret "yyyy"
 
 For API-key sessions, attachment reads and `sync` automatically recover from expired or server-rejected access tokens when the current CLI process has `TACET_CLIENT_ID` and `TACET_CLIENT_SECRET` set. `BW_CLIENTID` and `BW_CLIENTSECRET` are fallback aliases; the `TACET_` variables take precedence. Tacet authenticates against the session's existing server, requires the client ID to match the session, and retries the failed request once without prompting. The daemon's environment can differ from the CLI's environment.
 
-Recovery replaces only the session tokens, preserving cached items and the current lock state. It does not require `TACET_PASSWORD` or persist the API client secret. Field reads, `inject`, and `run` resolve text fields from the local cache without checking or renewing server tokens. An expired server token alone does not interrupt those operations, but a locked vault still requires `tacet unlock`. Password sessions and sessions without matching, non-empty environment credentials do not attempt API-key recovery.
+Recovery replaces only the session tokens, preserving cached items and the current lock state. It does not require `TACET_PASSWORD` or persist the API client secret. Text fields in `read`, `inject`, and `run` resolve from the local cache without checking or renewing server tokens. Attachment references in any of these commands require an online server and support the same API-key recovery. An expired server token alone does not interrupt text-field resolution, but a locked vault still requires `tacet unlock`. Password sessions and sessions without matching, non-empty environment credentials do not attempt API-key recovery.
 
 When upgrading to this feature, update both `tacet` and `tacetd` and restart the daemon. Sessions created before this feature require one explicit API-key login to record their login method and enable automatic recovery.
 
@@ -178,6 +178,8 @@ tacet inject --in-dir ./templates --out-dir ./rendered
 tacet inject --in-dir ./configs --in-place
 ```
 
+Templates can reference attachments explicitly, such as `{{ tacet://personal/Server/files/config.yml }}`, or implicitly by filename or ID when no field matches. Attachments are downloaded and verified, then decoded as strict UTF-8. Original whitespace is preserved; invalid UTF-8 returns an error. Use `?encoding=base64` or `?encoding=hex` for binary attachments. Attachment downloads require network access and valid server authentication. Any lookup, download, decryption, or decoding error aborts before output is written.
+
 Directory mode (`--in-dir` with exactly one of `--out-dir` or `--in-place`, which cannot be combined with `-i`/`-o`):
 
 - Mirrors the input structure; only files containing placeholders are written. Add `--copy-all` to also copy all other files (including binary ones) unchanged.
@@ -198,7 +200,12 @@ tacet run --env-file .env -- npm start
 
 # Or execute commands directly
 DATABASE_URL="tacet://personal/Database/uri" tacet run -- ./migrate.sh
+
+# Inject a text attachment, preserving whitespace and newlines
+CLIENT_CERT="tacet://personal/Server/files/client.pem" tacet run -- ./client
 ```
+
+`run` resolves attachments using the same matching and strict UTF-8 rules as `inject`. Values containing NUL bytes are rejected before launching the command because environment variables cannot contain NUL; base64 or hex encoding can represent binary attachments. Multiline secrets are masked line by line on stdout and stderr, with the existing minimum of four bytes per masked line.
 
 ### 7. Lock and Unlock
 Lock key custody manually, or restore session using your Master Password:
@@ -263,7 +270,7 @@ Unqualified targets match a built-in field first, then a custom field, then an a
 - `json=<dot.path>`: Parse JSON payload and extract field (e.g., `?json=credentials.client_secret`).
 - `trim=true|false`: Strip leading/trailing whitespace and newlines when `true` (default: `false`).
 
-For attachments, `encoding=base64` and `encoding=hex` operate on the original bytes. Trimming does not apply. Explicit `trim` and `json` modifiers are rejected. Attachment references are supported by `tacet read`; `inject` and `run` continue to accept text fields only.
+For attachments, `encoding=base64` and `encoding=hex` operate on the original bytes. Whitespace is preserved, consistent with the `trim=false` default. Explicit `trim` and `json` modifiers are rejected. Attachment references work in `read`, `inject`, and `run`; `read` returns raw bytes, while `inject` and `run` require valid UTF-8 after any encoding.
 
 ---
 

@@ -19,6 +19,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ITEM_ID: &str = "12345678-1234-1234-1234-123456789abc";
 const ORIGINAL: &[u8] = b" \tMZ\0\xff\xfe\x80\r\n\n ";
+const TEXT_ATTACHMENT: &str = " \tfirst secret line\r\nsecond secret line 日本語\n\n ";
 
 fn blob(key: &SymmetricKey, plaintext: &[u8]) -> Vec<u8> {
     let encrypted = key.encrypt_type2(plaintext).unwrap();
@@ -462,9 +463,11 @@ async fn cli_binary_output_metadata_and_text_compatibility() {
         client.read(&listed.attachments[0].uri).await.unwrap().bytes,
         ORIGINAL
     );
-    assert!(
-        matches!(client.resolve(vec!["tacet://personal/Server/example.exe".into()]).await, Err(DaemonClientError::HttpStatus { status, .. }) if status.as_u16() == 400)
-    );
+    assert!(matches!(
+        client.resolve(vec!["tacet://personal/Server/example.exe".into()]).await,
+        Err(DaemonClientError::HttpStatus { status, message, .. })
+            if status.as_u16() == 400 && message.contains("not valid UTF-8")
+    ));
     let requests = h.upstream.received_requests().await.unwrap();
     assert!(requests
         .iter()
@@ -485,34 +488,322 @@ async fn cli_tampered_attachment_outputs_no_plaintext() {
 }
 
 #[tokio::test]
-async fn lock_during_download_blocks_plaintext_and_does_not_wait_for_network() {
+async fn batch_resolves_fields_and_explicit_or_implicit_text_attachments() {
     let h = Harness::new().await;
-    h.mount(h.encrypted.clone(), Duration::from_secs(1)).await;
+    h.mount(
+        blob(&SymmetricKey::new([30; 64]), TEXT_ATTACHMENT.as_bytes()),
+        Duration::ZERO,
+    )
+    .await;
     let client = DaemonClient::new(&h.socket);
-    let task =
-        tokio::spawn(async move { client.read("tacet://personal/Server/example.exe").await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if h.upstream
-                .received_requests()
-                .await
-                .unwrap()
+    let cases = [
+        ("example.exe", TEXT_ATTACHMENT.to_string()),
+        ("files/example.exe", TEXT_ATTACHMENT.to_string()),
+        ("files/attachment-0", TEXT_ATTACHMENT.to_string()),
+        ("password", "field-password".into()),
+        ("config.yml", "".into()),
+        (
+            "files/example.exe?encoding=base64",
+            BASE64.encode(TEXT_ATTACHMENT),
+        ),
+        (
+            "example.exe?encoding=hex",
+            TEXT_ATTACHMENT
+                .as_bytes()
                 .iter()
-                .any(|req| req.url.path() == "/blob")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        ),
+    ];
+    let uris: Vec<_> = cases
+        .iter()
+        .map(|(target, _)| format!("tacet://personal/Server/{target}"))
+        .collect();
+    let response = client.resolve(uris.clone()).await.unwrap();
+    for (uri, (_, expected)) in uris.iter().zip(cases) {
+        assert_eq!(response.secrets[uri], expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn cli_injects_attachments_to_stdout_directories_and_in_place() {
+    let h = Harness::new().await;
+    h.mount(
+        blob(&SymmetricKey::new([30; 64]), TEXT_ATTACHMENT.as_bytes()),
+        Duration::ZERO,
+    )
+    .await;
+    let source = h._tmp.path().join("templates");
+    std::fs::create_dir(&source).unwrap();
+    let template = source.join("config");
+    let template_text = "prefix:{{ tacet://personal/Server/example.exe }}:suffix";
+    let expected = format!("prefix:{TEXT_ATTACHMENT}:suffix");
+    std::fs::write(&template, template_text).unwrap();
+    let input = template.to_str().unwrap();
+    let output = h.cli_with_env(&["inject", "-i", input], &[]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, expected.as_bytes());
+
+    let destination = h._tmp.path().join("rendered");
+    let output = h
+        .cli_with_env(
+            &[
+                "inject",
+                "--in-dir",
+                source.to_str().unwrap(),
+                "--out-dir",
+                destination.to_str().unwrap(),
+            ],
+            &[],
+        )
+        .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(destination.join("config")).unwrap(),
+        expected.as_bytes()
+    );
+
+    std::fs::write(&template, "{{ tacet://personal/Server/files/example.exe }}").unwrap();
+    let output = h
+        .cli_with_env(&["inject", "-i", input, "--in-place"], &[])
+        .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&template).unwrap(),
+        TEXT_ATTACHMENT.as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn cli_run_preserves_attachment_whitespace_and_masks_multiline_output() {
+    let h = Harness::new().await;
+    h.mount(
+        blob(&SymmetricKey::new([30; 64]), TEXT_ATTACHMENT.as_bytes()),
+        Duration::ZERO,
+    )
+    .await;
+    for reference in [
+        "tacet://personal/Server/example.exe",
+        "tacet://personal/Server/files/example.exe",
+        "{{ tacet://personal/Server/files/example.exe }}",
+    ] {
+        let output = h
+            .cli_with_env(
+                &[
+                    "run",
+                    "--no-mask",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf '%s' \"$TACET_TEST_ATTACHMENT\"",
+                ],
+                &[("TACET_TEST_ATTACHMENT", reference)],
+            )
+            .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, TEXT_ATTACHMENT.as_bytes());
+    }
+    let output = h.cli_with_env(
+        &["run", "--", "sh", "-c", "printf '%s' \"$TACET_TEST_ATTACHMENT\"; printf '%s' \"$TACET_TEST_ATTACHMENT\" >&2"],
+        &[("TACET_TEST_ATTACHMENT", "tacet://personal/Server/example.exe")],
+    ).await;
+    assert!(output.status.success());
+    let expected = b"[TACET_MASKED]\n[TACET_MASKED]\n\n \n";
+    assert_eq!(output.stdout, expected);
+    assert_eq!(output.stderr, expected);
+}
+
+#[tokio::test]
+async fn cli_attachment_failures_abort_before_writes_or_child_execution() {
+    for failure in ["utf8", "nul", "tampered", "missing", "download"] {
+        let h = Harness::new().await;
+        let mut bytes = match failure {
+            "nul" => blob(&SymmetricKey::new([30; 64]), b"secret\0value"),
+            _ => h.encrypted.clone(),
+        };
+        if failure == "tampered" {
+            bytes[49] ^= 1;
         }
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_millis(200), h.state.lock())
+        if failure == "download" {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/api/ciphers/{ITEM_ID}/attachment/attachment-0"
+                )))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(2)
+                .mount(&h.upstream)
+                .await;
+        } else {
+            h.mount(bytes, Duration::ZERO).await;
+        }
+        let uri = if failure == "missing" {
+            "tacet://personal/Server/files/missing"
+        } else {
+            "tacet://personal/Server/example.exe"
+        };
+        let expected_error = match failure {
+            "nul" => "NUL byte",
+            "tampered" => "HMAC verification failed",
+            "missing" => "404 Not Found",
+            "download" => "Could not obtain attachment download URL",
+            _ => "not valid UTF-8",
+        };
+        let marker = h._tmp.path().join("child-ran");
+        let output = h
+            .cli_with_env(
+                &[
+                    "run",
+                    "--",
+                    "sh",
+                    "-c",
+                    "touch \"$1\"",
+                    "sh",
+                    marker.to_str().unwrap(),
+                ],
+                &[("TACET_TEST_ATTACHMENT", uri)],
+            )
+            .await;
+        assert!(!output.status.success(), "{failure}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("secret\0value"));
+        assert!(!marker.exists());
+
+        let source = h._tmp.path().join("templates");
+        std::fs::create_dir(&source).unwrap();
+        let template = source.join("attachment");
+        let contents = format!("{{{{ {uri} }}}}");
+        std::fs::write(&template, &contents).unwrap();
+        std::fs::write(
+            source.join("field"),
+            "{{ tacet://personal/Server/password }}",
+        )
+        .unwrap();
+        let output = h
+            .cli_with_env(
+                &["inject", "--in-dir", source.to_str().unwrap(), "--in-place"],
+                &[],
+            )
+            .await;
+        if failure == "nul" {
+            // NUL is valid UTF-8 and is supported in rendered files, but not environments.
+            assert!(output.status.success());
+            assert_eq!(std::fs::read(&template).unwrap(), b"secret\0value");
+        } else {
+            assert!(!output.status.success(), "{failure}");
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains(expected_error));
+            assert_eq!(std::fs::read_to_string(&template).unwrap(), contents);
+            assert_eq!(
+                std::fs::read_to_string(source.join("field")).unwrap(),
+                "{{ tacet://personal/Server/password }}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cli_inject_and_run_encode_binary_attachments_and_reauthenticate() {
+    for operation in ["inject", "run"] {
+        let h = Harness::new().await;
+        h.expire_api_session().await;
+        h.mount_api_reauthentication(200).await;
+        h.mount(h.encrypted.clone(), Duration::ZERO).await;
+        let uri = "tacet://personal/Server/example.exe?encoding=base64";
+        let output = if operation == "inject" {
+            let template = h._tmp.path().join("template");
+            std::fs::write(&template, format!("{{{{ {uri} }}}}")).unwrap();
+            h.cli_with_env(&["inject", "-i", template.to_str().unwrap()], CI_API_ENV)
+                .await
+        } else {
+            let mut env = CI_API_ENV.to_vec();
+            env.push(("TACET_TEST_ATTACHMENT", uri));
+            h.cli_with_env(
+                &[
+                    "run",
+                    "--no-mask",
+                    "--",
+                    "sh",
+                    "-c",
+                    "printf '%s' \"$TACET_TEST_ATTACHMENT\"",
+                ],
+                &env,
+            )
+            .await
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, BASE64.encode(ORIGINAL).as_bytes());
+        assert!(output.stderr.is_empty());
+        assert!(h.state.is_unlocked().await);
+    }
+}
+
+#[tokio::test]
+async fn lock_during_download_blocks_plaintext_and_does_not_wait_for_network() {
+    for batch in [false, true] {
+        let h = Harness::new().await;
+        h.mount(h.encrypted.clone(), Duration::from_secs(1)).await;
+        let client = DaemonClient::new(&h.socket);
+        let task = tokio::spawn(async move {
+            if batch {
+                client
+                    .resolve(vec!["tacet://personal/Server/example.exe".into()])
+                    .await
+                    .map(|_| ())
+            } else {
+                client
+                    .read("tacet://personal/Server/example.exe")
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if h.upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|req| req.url.path() == "/blob")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
         .unwrap();
-    assert!(
-        matches!(task.await.unwrap(), Err(DaemonClientError::HttpStatus { status, .. }) if status.as_u16() == 401)
-    );
+        tokio::time::timeout(Duration::from_millis(200), h.state.lock())
+            .await
+            .unwrap();
+        assert!(
+            matches!(task.await.unwrap(), Err(DaemonClientError::HttpStatus { status, .. }) if status.as_u16() == 401)
+        );
+    }
 }
 
 #[tokio::test]
@@ -589,6 +880,10 @@ async fn read_api_errors_and_expired_session_refresh() {
     ] {
         assert!(
             matches!(client.read(&format!("tacet://personal/Server/{target}")).await,
+            Err(DaemonClientError::HttpStatus { status, .. }) if status.as_u16() == expected_status)
+        );
+        assert!(
+            matches!(client.resolve(vec![format!("tacet://personal/Server/{target}")]).await,
             Err(DaemonClientError::HttpStatus { status, .. }) if status.as_u16() == expected_status)
         );
     }

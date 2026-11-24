@@ -19,6 +19,12 @@ impl StreamMasker {
             if str_ref.len() >= 4 {
                 unique.insert(str_ref.to_string());
             }
+            // Child output is processed one line at a time, including multiline secrets.
+            for line in str_ref.lines() {
+                if line.len() >= 4 {
+                    unique.insert(line.to_string());
+                }
+            }
         }
 
         // Sort descending by length so longer substrings are masked first

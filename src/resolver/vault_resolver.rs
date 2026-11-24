@@ -104,7 +104,8 @@ impl<'a> VaultResolver<'a> {
         self.user_rsa_key
     }
 
-    /// Resolves a parsed `TacetUri` to its plaintext secret string.
+    /// Resolves a cached text field to its plaintext secret string.
+    /// Attachments require `select_read` followed by a download through the daemon.
     pub fn resolve(&self, uri: &TacetUri) -> Result<String, ResolverError> {
         match self.select_read(uri)? {
             ReadTarget::Text(value) => Ok(value),

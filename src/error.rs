@@ -121,7 +121,7 @@ pub enum ResolverError {
     #[error("Ambiguous attachment '{file}': matching IDs [{matches}]")]
     AmbiguousAttachment { file: String, matches: String },
 
-    #[error("Attachments require 'tacet read'; inject and run support text fields only")]
+    #[error("Attachment resolution requires a download through the daemon")]
     AttachmentRequiresRead,
 
     #[error("Attachment references do not support json or explicit trim modifiers")]

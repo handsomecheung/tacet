@@ -202,6 +202,7 @@ impl DaemonClient {
             .await
     }
 
+    /// Resolves fields and attachments as text, downloading attachments as needed.
     pub async fn resolve(&self, uris: Vec<String>) -> Result<ResolveResponse, DaemonClientError> {
         let req = ResolveRequest { uris };
         self.send_json(Method::POST, "/v1/resolve", Some(&req))
