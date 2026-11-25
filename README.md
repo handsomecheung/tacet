@@ -235,16 +235,24 @@ tacet://<scope>/<item>/<target>[?<modifiers>]
 | `personal` | Personal vault (`organizationId == null`), ignoring folder hierarchy |
 | `personal/<folder>` | Items inside a specific personal folder (nested paths like `folder/subfolder` use `/` directly) |
 | `org/<org_name>/<collection>` | Shared items inside an Organization's collection (nested paths like `col1/col2` use `/` directly) |
-| `*` | Search all accessible vaults (fails fast if ambiguous) |
+| `org/<org_name>` | Items referenced by UUID within the specified organization, without a collection restriction |
+
+Wildcard scope (`*`, including `%2A`) is no longer supported. Replace existing wildcard URIs with an explicit `personal` or `org/...` scope. `tacet list '*'` is also rejected; use `tacet list` without a scope to discover all cached items.
+
+Update both `tacet` and `tacetd` and restart the daemon when upgrading to these scope rules.
 
 ### 2. `<item>` Rules
 
 - Case-insensitive search by item `name` (e.g., `GitHub`, `Postgres DB`).
 - Supports exact 36-character item `UUID` (e.g., `d3b07384-d113-46fb-9c88-e9f02c61e808`).
+- UUID references match item IDs only and never fall back to item names. Scope restrictions still apply; an item in another personal folder, collection, or organization is not selected when that restriction is specified.
+- For production CI/CD, prefer an explicit scope and item UUID: `tacet://personal/<UUID>/password` or `tacet://org/<org_name>/<UUID>/password`. Personal folders may be omitted; organization collections may be omitted only for UUID references. Organization names or IDs are accepted. This pins the item identity, not the secret value: updates and TOTP can still change the returned value.
 - Nested collection and folder paths use `/` directly, e.g. `tacet://org/Default/Network/Koishi/Infra/wireproxy/password`. Existing `%2F`-encoded paths remain supported.
 - Paths are parsed from the end: `<item>/<target>`, `<item>/fields/<custom_field>`, or `<item>/files/<filename-or-id>`. The preceding path is the collection or folder. The literal `fields` and `files` segments immediately before the final segment introduce an explicit custom field or attachment, respectively.
 - Spaces can be preserved inside quotes; slashes inside organization, item, and field names must be encoded as `%2F`.
 - If multiple items match the query, Tacet returns a disambiguation error listing matching UUIDs and folders.
+
+Attachment discovery (`GET /v1/items/{item_id}/attachments`) returns explicit, UUID-based URIs: `tacet://personal/<UUID>/files/<attachment-id>` or `tacet://org/<org-id>/<UUID>/files/<attachment-id>`.
 
 ### 3. `<target>` Mapping
 

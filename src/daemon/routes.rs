@@ -705,6 +705,7 @@ fn resolver_response(error: ResolverError) -> ApiError {
             StatusCode::CONFLICT
         }
         ResolverError::AttachmentRequiresRead
+        | ResolverError::InvalidScope(_)
         | ResolverError::InvalidAttachmentModifier
         | ResolverError::JsonPathError(_) => StatusCode::BAD_REQUEST,
         ResolverError::Crypto(_) => StatusCode::BAD_GATEWAY,
@@ -918,12 +919,7 @@ async fn list_handler(
 
     let items = resolver
         .list_items(query.scope.as_deref(), query.search.as_deref())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(format!("Failed to list items: {e}"))),
-            )
-        })?;
+        .map_err(resolver_response)?;
 
     let total = items.len();
     Ok(Json(ListResponse { items, total }))

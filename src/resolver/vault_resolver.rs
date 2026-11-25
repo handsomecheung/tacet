@@ -4,7 +4,7 @@ use crate::error::ResolverError;
 use crate::resolver::json_path::extract_json_path;
 use crate::resolver::totp::generate_totp;
 use crate::upstream::models::{AttachmentResponse, CipherResponse, SyncResponse};
-use crate::uri::parser::{CipherFieldTarget, Encoding, Scope, TacetUri};
+use crate::uri::parser::{is_item_uuid, CipherFieldTarget, Encoding, Scope, TacetUri};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use rsa::RsaPrivateKey;
@@ -26,6 +26,7 @@ pub struct ResolvedAttachment {
 pub struct AttachmentSummary {
     pub id: String,
     pub name: String,
+    /// A UUID-based URI with an explicit personal or organization scope.
     pub uri: String,
 }
 
@@ -248,9 +249,32 @@ impl<'a> VaultResolver<'a> {
         })
     }
 
+    /// Lists cached attachments by exact item UUID, using organization IDs in returned URIs.
     pub fn list_attachments(&self, item_id: &str) -> Result<Vec<AttachmentSummary>, ResolverError> {
-        let candidates = self.filter_scope(&Scope::All)?;
-        let (cipher, base_key) = self.match_item(&candidates, item_id, &Scope::All)?;
+        let cipher = self
+            .vault
+            .ciphers
+            .iter()
+            .find(|cipher| cipher.id.eq_ignore_ascii_case(item_id))
+            .ok_or_else(|| ResolverError::ItemNotFound {
+                item: item_id.to_string(),
+                scope: "item UUID".to_string(),
+            })?;
+        let (scope, base_key) = match &cipher.organization_id {
+            Some(org_id) => (
+                format!(
+                    "org/{}",
+                    percent_encoding::utf8_percent_encode(
+                        org_id,
+                        percent_encoding::NON_ALPHANUMERIC,
+                    )
+                ),
+                self.org_keys
+                    .get(org_id)
+                    .ok_or_else(|| ResolverError::MissingOrgKey(org_id.clone()))?,
+            ),
+            None => ("personal".to_string(), self.user_key),
+        };
         let key = Self::cipher_key(cipher, base_key)?;
         cipher
             .attachments
@@ -265,7 +289,7 @@ impl<'a> VaultResolver<'a> {
                 Ok(AttachmentSummary {
                     id: attachment.id.clone(),
                     name: key.decrypt_type2_string(&attachment.file_name)?,
-                    uri: format!("tacet://*/{}/files/{id}", cipher.id),
+                    uri: format!("tacet://{scope}/{}/files/{id}", cipher.id),
                 })
             })
             .collect()
@@ -286,6 +310,9 @@ impl<'a> VaultResolver<'a> {
         scope_filter: Option<&str>,
         search_filter: Option<&str>,
     ) -> Result<Vec<VaultItemSummary>, ResolverError> {
+        if scope_filter.is_some_and(|scope| scope.trim() == "*") {
+            return Err(ResolverError::InvalidScope("*".to_string()));
+        }
         // Pre-decrypt all personal folder names
         let mut folder_names: HashMap<String, String> = HashMap::new();
         for f in &self.vault.folders {
@@ -386,7 +413,7 @@ impl<'a> VaultResolver<'a> {
                 // Apply scope filter if specified
                 if let Some(scope_req) = scope_filter {
                     let trimmed = scope_req.trim();
-                    if !trimmed.is_empty() && trimmed != "*" {
+                    if !trimmed.is_empty() {
                         if trimmed.eq_ignore_ascii_case("personal") {
                             if !is_personal {
                                 continue;
@@ -511,7 +538,12 @@ impl<'a> VaultResolver<'a> {
                 collection,
             } => {
                 let (org_id, org_key) = self.find_org_and_key(org_name)?;
-                let col_id = self.find_collection_id(&org_id, org_key, collection, org_name)?;
+                let col_id = collection
+                    .as_deref()
+                    .map(|collection| {
+                        self.find_collection_id(&org_id, org_key, collection, org_name)
+                    })
+                    .transpose()?;
 
                 let filtered = self
                     .vault
@@ -519,25 +551,15 @@ impl<'a> VaultResolver<'a> {
                     .iter()
                     .filter(|c| {
                         c.organization_id.as_deref() == Some(&org_id)
-                            && c.collection_ids.contains(&col_id)
+                            && match &col_id {
+                                Some(col_id) => c.collection_ids.contains(col_id),
+                                None => true,
+                            }
                     })
                     .map(|c| (c, org_key))
                     .collect();
 
                 Ok(filtered)
-            }
-            Scope::All => {
-                let mut all = Vec::new();
-                for c in &self.vault.ciphers {
-                    if let Some(org_id) = &c.organization_id {
-                        if let Some(key) = self.org_keys.get(org_id) {
-                            all.push((c, key));
-                        }
-                    } else {
-                        all.push((c, self.user_key));
-                    }
-                }
-                Ok(all)
             }
         }
     }
@@ -614,13 +636,17 @@ impl<'a> VaultResolver<'a> {
         item_query: &str,
         scope: &Scope,
     ) -> Result<(&'a CipherResponse, &'s SymmetricKey), ResolverError> {
-        let is_uuid = item_query.len() == 36 && uuid::Uuid::parse_str(item_query).is_ok();
+        let is_uuid = is_item_uuid(item_query);
 
         let mut matches = Vec::new();
         for &(cipher, key) in candidates {
-            if is_uuid && cipher.id.eq_ignore_ascii_case(item_query) {
-                matches.push((cipher, key, item_query.to_string()));
-            } else if let Ok(dec_name) = Self::cipher_key(cipher, key).and_then(|key| {
+            if is_uuid {
+                if cipher.id.eq_ignore_ascii_case(item_query) {
+                    matches.push((cipher, key, item_query.to_string()));
+                }
+                continue;
+            }
+            if let Ok(dec_name) = Self::cipher_key(cipher, key).and_then(|key| {
                 key.decrypt_type2_string(&cipher.name)
                     .map_err(ResolverError::Crypto)
             }) {

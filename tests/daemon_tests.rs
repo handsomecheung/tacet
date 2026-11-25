@@ -267,13 +267,13 @@ async fn test_daemon_full_rest_lifecycle() {
     assert_eq!(archived.secrets[archived_uri], "sk-live-secret-42");
     let archived_id = "22222222-2222-2222-2222-222222222222";
     assert!(client
-        .read(&format!("tacet://*/{archived_id}/password"))
+        .read(&format!("tacet://personal/{archived_id}/password"))
         .await
         .is_ok());
     assert!(client.attachments(archived_id).await.is_ok());
 
     let trashed_id = "33333333-3333-3333-3333-333333333333";
-    let uri = format!("tacet://*/{trashed_id}/password");
+    let uri = format!("tacet://personal/{trashed_id}/password");
     for error in [
         client.resolve(vec![uri.clone()]).await.unwrap_err(),
         client

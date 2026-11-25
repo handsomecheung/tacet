@@ -317,6 +317,109 @@ fn test_resolve_organization_with_rsa_key() {
 }
 
 #[test]
+fn test_uuid_resolution_stays_within_explicit_scope() {
+    let (mut vault, user_key, rsa_priv, org_key) = setup_test_vault();
+    let personal_id = vault.ciphers[1].id.clone();
+    let org_id = vault.ciphers.last().unwrap().id.clone();
+    vault
+        .profile
+        .as_mut()
+        .unwrap()
+        .organizations
+        .push(ProfileOrganizationResponse {
+            id: "other-org".into(),
+            name: "OtherCorp".into(),
+            key: Some(user_key.encrypt_type2(org_key.as_bytes()).unwrap()),
+        });
+    vault.collections.push(CollectionResponse {
+        id: "other-collection".into(),
+        organization_id: "org-uuid-1".into(),
+        name: org_key.encrypt_type2_string("OtherCollection").unwrap(),
+    });
+    {
+        let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
+        assert_eq!(
+            resolver
+                .resolve_str(&format!("tacet://personal/{personal_id}/password"))
+                .unwrap(),
+            "dev_pg_password"
+        );
+        assert_eq!(
+            resolver
+                .resolve_str(&format!("tacet://org/AcmeCorp/{org_id}/password"))
+                .unwrap(),
+            "ultra_secure_prod_password"
+        );
+        for uri in [
+            format!("tacet://personal/{org_id}/password"),
+            format!("tacet://org/AcmeCorp/{personal_id}/password"),
+            format!("tacet://org/OtherCorp/{org_id}/password"),
+            format!("tacet://org/AcmeCorp/OtherCollection/{org_id}/password"),
+        ] {
+            assert!(
+                matches!(
+                    resolver.resolve_str(&uri),
+                    Err(tacet::error::TacetError::Resolver(
+                        ResolverError::ItemNotFound { .. }
+                    ))
+                ),
+                "{uri}"
+            );
+        }
+    }
+    // UUID references do not depend on collection membership or a decryptable item name.
+    vault.collections.clear();
+    let item = vault.ciphers.last_mut().unwrap();
+    item.collection_ids.clear();
+    item.name = "invalid encrypted name".into();
+    item.fields = Some(vec![CipherFieldResponse {
+        name: Some(org_key.encrypt_type2_string("token").unwrap()),
+        value: Some(org_key.encrypt_type2_string("custom-token").unwrap()),
+        field_type: Some(0),
+    }]);
+    let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
+    for (target, expected) in [
+        ("password", "ultra_secure_prod_password"),
+        ("fields/token", "custom-token"),
+    ] {
+        assert_eq!(
+            resolver
+                .resolve_str(&format!("tacet://org/AcmeCorp/{org_id}/{target}"))
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn test_uuid_never_falls_back_to_item_name() {
+    let (mut vault, user_key, rsa_priv, _) = setup_test_vault();
+    let id = vault.ciphers[0].id.clone();
+    vault.ciphers[1].name = user_key.encrypt_type2_string(&id).unwrap();
+    {
+        let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
+        assert_eq!(
+            resolver
+                .resolve_str(&format!("tacet://personal/{id}/password"))
+                .unwrap(),
+            "ghp_secret_password"
+        );
+    }
+    vault.ciphers.remove(0);
+    let resolver = VaultResolver::new(&vault, &user_key, Some(&rsa_priv));
+    assert!(matches!(
+        resolver.resolve_str(&format!("tacet://personal/{id}/password")),
+        Err(tacet::error::TacetError::Resolver(
+            ResolverError::ItemNotFound { .. }
+        ))
+    ));
+    assert!(matches!(
+        resolver.list_attachments(&id),
+        Err(ResolverError::ItemNotFound { .. })
+    ));
+}
+
+#[test]
 fn test_resolve_item_in_multiple_nested_collections() {
     let (mut vault, user_key, rsa_priv, org_key) = setup_test_vault();
     let paths = ["Network/Umbilical/Infra", "Network/Koshi/Infra"];

@@ -94,11 +94,6 @@ fn attachment_uri_paths_and_escaped_names() {
             "config.yml",
         ),
         (
-            "tacet://*/Server/files/example.exe",
-            "Server",
-            "example.exe",
-        ),
-        (
             "tacet://personal/Server/files/fields%2Fname",
             "Server",
             "fields/name",
@@ -116,10 +111,10 @@ fn attachment_uri_paths_and_escaped_names() {
     let uri = TacetUri::parse("tacet://personal/Server/fields/files").unwrap();
     assert_eq!(uri.field, CipherFieldTarget::CustomField("files".into()));
     assert_eq!(
-        TacetUri::parse("tacet://*/Server/files/config.yml")
+        TacetUri::parse("tacet://personal/Server/files/config.yml")
             .unwrap()
             .scope,
-        Scope::All
+        Scope::Personal { folder: None }
     );
     assert!(TacetUri::parse("tacet://org/Engineering/Server/files/config.yml").is_err());
 }
@@ -250,6 +245,30 @@ fn attachment_key_versions_and_organization_scope() {
             let listed = resolver.list_items(None, None).unwrap();
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].id, ITEM_ID);
+            let attachments = resolver.list_attachments(ITEM_ID).unwrap();
+            let discovered_uri = TacetUri::parse(&attachments[0].uri).unwrap();
+            assert_eq!(discovered_uri.item, ITEM_ID);
+            assert_eq!(
+                discovered_uri.scope,
+                if organization {
+                    Scope::Organization {
+                        org_name: "org-id".into(),
+                        collection: None,
+                    }
+                } else {
+                    Scope::Personal { folder: None }
+                }
+            );
+            let ReadTarget::Attachment(selected) = resolver.select_read(&discovered_uri).unwrap()
+            else {
+                panic!("Expected attachment")
+            };
+            assert_eq!(
+                resolver
+                    .decrypt_attachment(&selected, &blob(content_key, ORIGINAL), &discovered_uri)
+                    .unwrap(),
+                ORIGINAL
+            );
             for (query, expected) in [
                 ("", ORIGINAL.to_vec()),
                 ("?encoding=base64", BASE64.encode(ORIGINAL).into_bytes()),
@@ -399,6 +418,77 @@ impl Harness {
             .await
             .unwrap()
     }
+}
+
+#[tokio::test]
+async fn wildcard_references_fail_before_output_or_execution() {
+    let h = Harness::new().await;
+    let client = DaemonClient::new(&h.socket);
+    for uri in [
+        "tacet://*/Server/password",
+        "tacet://%2A/Server/files/example.exe",
+    ] {
+        assert!(matches!(client.read(uri).await,
+            Err(DaemonClientError::HttpStatus { status, message, .. })
+                if status == 400 && message.contains("Wildcard scope")
+        ));
+        assert!(matches!(client.resolve(vec![uri.to_string()]).await,
+            Err(DaemonClientError::HttpStatus { status, message, .. })
+                if status == 400 && message.contains("Wildcard scope")
+        ));
+        let output = h.cli(uri, &[]).await;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Wildcard scope"));
+    }
+    assert!(matches!(
+        client.list(Some("*"), None).await,
+        Err(DaemonClientError::HttpStatus { status, .. }) if status == 400
+    ));
+    assert_eq!(client.list(None, None).await.unwrap().total, 1);
+
+    let template = h._tmp.path().join("template");
+    let destination = h._tmp.path().join("rendered");
+    let text = "{{ tacet://personal/Server/password }} {{ tacet://*/Server/password }}";
+    std::fs::write(&template, text).unwrap();
+    std::fs::write(&destination, "original content").unwrap();
+    let output = h
+        .cli_with_env(
+            &[
+                "inject",
+                "-i",
+                template.to_str().unwrap(),
+                "-o",
+                destination.to_str().unwrap(),
+            ],
+            &[],
+        )
+        .await;
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        "original content"
+    );
+    let output = h
+        .cli_with_env(
+            &["inject", "-i", template.to_str().unwrap(), "--in-place"],
+            &[],
+        )
+        .await;
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read_to_string(&template).unwrap(), text);
+
+    let marker = h._tmp.path().join("child-ran");
+    let output = h
+        .cli_with_env(
+            &["run", "--", "touch", marker.to_str().unwrap()],
+            &[("TACET_WILDCARD_TEST", "tacet://*/Server/password")],
+        )
+        .await;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists());
+    assert!(h.upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1185,7 +1275,7 @@ async fn cli_api_reauthentication_uses_current_env_and_preserves_unlocked_vault(
         h.mount(h.encrypted.clone(), Duration::ZERO).await;
 
         let output = h
-            .cli_with_env(&["read", "tacet://*/Server/example.exe"], &env)
+            .cli_with_env(&["read", "tacet://personal/Server/example.exe"], &env)
             .await;
         assert!(
             output.status.success(),
@@ -1268,7 +1358,7 @@ async fn cli_attachment_reauthenticates_when_server_rejects_unexpired_token() {
     h.mount(h.encrypted.clone(), Duration::ZERO).await;
 
     let output = h
-        .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+        .cli_with_env(&["read", "tacet://personal/Server/example.exe"], CI_API_ENV)
         .await;
     assert!(
         output.status.success(),
@@ -1307,7 +1397,7 @@ async fn cli_does_not_reauthenticate_without_matching_api_session_and_credential
                 .api_client_id = None;
         }
         let output = h
-            .cli_with_env(&["read", "tacet://*/Server/example.exe"], &env)
+            .cli_with_env(&["read", "tacet://personal/Server/example.exe"], &env)
             .await;
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
@@ -1321,18 +1411,21 @@ async fn cli_cached_fields_lookup_errors_and_locked_vault_do_not_reauthenticate(
     let h = Harness::new().await;
     h.expire_api_session().await;
     let output = h
-        .cli_with_env(&["read", "tacet://*/Server/password"], CI_API_ENV)
+        .cli_with_env(&["read", "tacet://personal/Server/password"], CI_API_ENV)
         .await;
     assert!(output.status.success());
     assert_eq!(output.stdout, b"field-password");
     let output = h
-        .cli_with_env(&["read", "tacet://*/Server/files/missing"], CI_API_ENV)
+        .cli_with_env(
+            &["read", "tacet://personal/Server/files/missing"],
+            CI_API_ENV,
+        )
         .await;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("404 Not Found"));
     h.state.lock().await;
     let output = h
-        .cli_with_env(&["read", "tacet://*/Server/password"], CI_API_ENV)
+        .cli_with_env(&["read", "tacet://personal/Server/password"], CI_API_ENV)
         .await;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("tacet unlock"));
@@ -1355,7 +1448,7 @@ async fn cli_reauthentication_failures_are_bounded_and_do_not_leak_credentials()
             .mount(&h.upstream)
             .await;
         let output = h
-            .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+            .cli_with_env(&["read", "tacet://personal/Server/example.exe"], CI_API_ENV)
             .await;
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
@@ -1400,7 +1493,7 @@ async fn cli_blob_401_does_not_reauthenticate_vault_session() {
         .mount(&h.upstream)
         .await;
     let output = h
-        .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+        .cli_with_env(&["read", "tacet://personal/Server/example.exe"], CI_API_ENV)
         .await;
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
@@ -1434,7 +1527,7 @@ async fn cli_api_reauthentication_distinguishes_invalid_refresh_from_server_outa
             h.mount(h.encrypted.clone(), Duration::ZERO).await;
         }
         let output = h
-            .cli_with_env(&["read", "tacet://*/Server/example.exe"], CI_API_ENV)
+            .cli_with_env(&["read", "tacet://personal/Server/example.exe"], CI_API_ENV)
             .await;
         if refresh_status == 400 {
             assert!(

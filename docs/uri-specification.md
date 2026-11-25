@@ -20,9 +20,13 @@ The scope determines the boundary within which Tacet looks up items in your Bitw
 | `personal/<item>/<field>` | Personal vault item (without folder restriction) | `tacet://personal/GitHub/password` |
 | `personal/<folder>/<item>/<field>` | Items located inside a specific personal folder (nested paths like `folder/subfolder` use `/` directly) | `tacet://personal/Work/AWS/totp`<br>`tacet://personal/Dev/Frontend/Vercel/token` |
 | `org/<org_name>/<collection>/<item>/<field>` | Items inside an Organization's collection (nested paths like `col1/col2` use `/` directly) | `tacet://org/AcmeCorp/Infrastructure/ProdDB/password`<br>`tacet://org/Default/DevOps/Infra/K8s/token` |
-| `*/<item>/<field>` | Global search across all accessible vaults (fails fast if ambiguous) | `tacet://*/OpenAI/api_key` |
+| `org/<org_name>/<UUID>/<field>` | Organization item by UUID, without collection restriction | `tacet://org/AcmeCorp/d3b07384-d113-46fb-9c88-e9f02c61e808/password` |
 
-For `personal` and `org` scopes, paths are parsed from the end: `<item>/<field>` or `<item>/fields/<custom_field>`. The preceding segments after the scope keyword (and organization name for `org`) form the folder or collection path. A `fields` segment immediately before the final segment introduces an explicit custom field when an item precedes it. Slashes within organization, item, and field names must use `%2F`; existing `%2F`-encoded folder and collection paths remain supported.
+Wildcard scope (`*`, including `%2A`) is no longer supported and returns an explicit URI error. Migrate existing wildcard URIs to `personal` or `org/...`. For listing all cached items, omit the scope (`tacet list`); `tacet list '*'` is rejected.
+
+Personal folders may be omitted. Organization collections may be omitted only when `<item>` is an exact 36-character UUID; name references still require a collection. Organization identifiers may be names or IDs. All item lookups remain within the specified scope, including UUID lookups.
+
+For `personal` and `org` scopes, paths are parsed from the end: `<item>/<field>`, `<item>/fields/<custom_field>`, or `<item>/files/<filename-or-id>`. The preceding segments after the scope keyword (and organization identifier for `org`) form the optional folder or collection path. A `fields` or `files` segment immediately before the final segment introduces an explicit custom field or attachment when an item precedes it. Slashes within organization, item, field, and attachment names must use `%2F`; existing `%2F`-encoded folder and collection paths remain supported.
 
 `tacet list` and `GET /v1/list` return item URI prefixes with `/` preserved in folder and collection paths, such as `tacet://org/Default/Network/Koishi/Infra/wireproxy`. Append `/password` or another field target to read a secret.
 
@@ -31,7 +35,7 @@ An organization item belonging to multiple collections produces one entry per co
 `GET /v1/list` reports the number of returned entries in `total`, which can exceed the number of unique item IDs. `tacet list --json` outputs the entries as an array with the same repeated IDs. The table footer distinguishes the two counts, for example `Total: 2 entries (1 unique item)`.
 
 > [!NOTE]
-> Following the **"One Obvious Way"** principle, Tacet strictly uses canonical scope keywords (`personal`, `org`, `*`). Shorthand symbols like `_` are intentionally unsupported to prevent ambiguity in configuration files.
+> Following the **"One Obvious Way"** principle, Tacet strictly uses canonical scope keywords (`personal`, `org`). Shorthand symbols like `_` are intentionally unsupported to prevent ambiguity in configuration files.
 
 ---
 
@@ -44,6 +48,10 @@ The `<item>` component matches a cipher item by either name or unique UUID.
 | Item Name (Case-insensitive) | Matches by item display name | `tacet://personal/github/password` |
 | Exact 36-char UUID | Direct lookup by Bitwarden item UUID | `tacet://personal/d3b07384-d113-46fb-9c88-e9f02c61e808/password` |
 | Percent-encoded Characters | Handles spaces (`%20`) or literal slashes (`%2F`) in item/folder names | `tacet://personal/prod%2Fcluster/k8s%20token/password` |
+
+UUID references match IDs only, never item names. Name references that match multiple items return an ambiguity error. For production CI/CD, prefer an explicit scope and item UUID, omitting folder or collection paths when unnecessary. UUIDs pin the referenced item, not its value; secret updates and live TOTP can change the returned value.
+
+Attachment discovery (`GET /v1/items/{item_id}/attachments`) returns `tacet://personal/<UUID>/files/<attachment-id>` or `tacet://org/<org-id>/<UUID>/files/<attachment-id>`, with URI components percent-encoded as needed. Organization attachment URIs do not depend on collection membership or organization names.
 
 ---
 

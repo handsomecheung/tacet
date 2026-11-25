@@ -106,6 +106,9 @@ pub enum UriError {
     #[error("Invalid scope '{0}'")]
     InvalidScope(String),
 
+    #[error("Wildcard scope '*' is no longer supported; use 'personal' or 'org/<organization>[/<collection>]' explicitly")]
+    WildcardScopeUnsupported,
+
     #[error("Missing URI component: {0}")]
     MissingComponent(&'static str),
 
@@ -115,6 +118,9 @@ pub enum UriError {
 
 #[derive(Error, Debug)]
 pub enum ResolverError {
+    #[error("Invalid scope '{0}': wildcard scope is no longer supported; omit the list scope to list all items")]
+    InvalidScope(String),
+
     #[error("Attachment '{file}' not found in item '{item}'")]
     AttachmentNotFound { file: String, item: String },
 

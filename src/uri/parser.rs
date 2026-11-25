@@ -7,13 +7,11 @@ use std::str::FromStr;
 pub enum Scope {
     /// `personal`: Personal vault (organizationId == null)
     Personal { folder: Option<String> },
-    /// `org/<org_name>/<collection>`: Shared items inside an Organization's collection
+    /// `org/<org_name>[/<collection>]`: Organization items; omitting the collection requires an item UUID.
     Organization {
         org_name: String,
-        collection: String,
+        collection: Option<String>,
     },
-    /// `*`: Search all accessible vaults (fails if ambiguous)
-    All,
 }
 
 impl fmt::Display for Scope {
@@ -25,9 +23,12 @@ impl fmt::Display for Scope {
             } => write!(f, "personal/{folder}"),
             Scope::Organization {
                 org_name,
-                collection,
+                collection: Some(collection),
             } => write!(f, "org/{org_name}/{collection}"),
-            Scope::All => write!(f, "*"),
+            Scope::Organization {
+                org_name,
+                collection: None,
+            } => write!(f, "org/{org_name}"),
         }
     }
 }
@@ -181,8 +182,9 @@ impl TacetUri {
             .first()
             .ok_or(UriError::MissingComponent("Empty URI path"))?;
         let scope_start = match scope_name.as_str() {
-            "personal" | "*" => 1,
+            "personal" => 1,
             "org" => 2,
+            "*" => return Err(UriError::WildcardScopeUnsupported),
             other => return Err(UriError::InvalidScope(other.to_string())),
         };
         if segments.len() < scope_start + 2 {
@@ -210,24 +212,17 @@ impl TacetUri {
                 folder: (item_idx > 1).then(|| segments[1..item_idx].join("/")),
             },
             "org" => {
-                if item_idx <= 2 {
+                if item_idx == 2 && !is_item_uuid(&segments[item_idx]) {
                     return Err(UriError::MissingComponent(
-                        "Organization URI requires a collection",
+                        "Organization URI requires a collection when referencing an item by name; use an item UUID to omit it",
                     ));
                 }
                 Scope::Organization {
                     org_name: segments[1].clone(),
-                    collection: segments[2..item_idx].join("/"),
+                    collection: (item_idx > 2).then(|| segments[2..item_idx].join("/")),
                 }
             }
-            _ => {
-                if item_idx != 1 {
-                    return Err(UriError::MissingComponent(
-                        "Wildcard URI requires item and target, without a folder",
-                    ));
-                }
-                Scope::All
-            }
+            other => return Err(UriError::InvalidScope(other.to_string())),
         };
         Ok(Self {
             raw: trimmed.to_string(),
@@ -238,4 +233,8 @@ impl TacetUri {
             modifiers,
         })
     }
+}
+
+pub(crate) fn is_item_uuid(value: &str) -> bool {
+    value.len() == 36 && uuid::Uuid::parse_str(value).is_ok()
 }

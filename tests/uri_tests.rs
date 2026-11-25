@@ -32,7 +32,7 @@ fn test_parse_organization_scope() {
         uri.scope,
         Scope::Organization {
             org_name: "Engineering".to_string(),
-            collection: "infrastructure".to_string(),
+            collection: Some("infrastructure".to_string()),
         }
     );
     assert_eq!(uri.item, "prod-db");
@@ -40,11 +40,54 @@ fn test_parse_organization_scope() {
 }
 
 #[test]
-fn test_parse_all_scope() {
-    let uri = TacetUri::parse("tacet://*/OpenAI%20API/api_key").unwrap();
-    assert_eq!(uri.scope, Scope::All);
-    assert_eq!(uri.item, "OpenAI API");
-    assert_eq!(uri.field, CipherFieldTarget::Named("api_key".to_string()));
+fn test_reject_wildcard_scope() {
+    for scope in ["*", "%2A", "%2a"] {
+        for path in [
+            "OpenAI%20API/api_key",
+            "item/fields/key",
+            "item/files/config",
+            "",
+        ] {
+            let error = TacetUri::parse(&format!("tacet://{scope}/{path}")).unwrap_err();
+            assert_eq!(error, UriError::WildcardScopeUnsupported);
+            assert!(error.to_string().contains("no longer supported"));
+        }
+    }
+}
+
+#[test]
+fn test_organization_uuid_without_collection() {
+    let id = "d3b07384-d113-46fb-9c88-e9f02c61e808";
+    for (target, field) in [
+        ("password", CipherFieldTarget::Password),
+        (
+            "fields/api%2Fkey",
+            CipherFieldTarget::CustomField("api/key".into()),
+        ),
+        (
+            "files/config.yml",
+            CipherFieldTarget::File("config.yml".into()),
+        ),
+    ] {
+        let uri = TacetUri::parse(&format!("tacet://org/Acme%2FCorp/{id}/{target}")).unwrap();
+        assert_eq!(
+            uri.scope,
+            Scope::Organization {
+                org_name: "Acme/Corp".into(),
+                collection: None
+            }
+        );
+        assert_eq!(uri.scope.to_string(), "org/Acme/Corp");
+        assert_eq!(uri.item, id);
+        assert_eq!(uri.field, field);
+    }
+    for item in ["Server", "not-a-uuid", "d3b07384d11346fb9c88e9f02c61e808"] {
+        for target in ["password", "fields/key", "files/config.yml"] {
+            let error = TacetUri::parse(&format!("tacet://org/Acme/{item}/{target}")).unwrap_err();
+            assert!(matches!(error, UriError::MissingComponent(_)));
+            assert!(error.to_string().contains("use an item UUID"));
+        }
+    }
 }
 
 #[test]
